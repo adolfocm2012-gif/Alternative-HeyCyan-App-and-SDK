@@ -166,6 +166,21 @@ class TuneBudsMediaSync(
         onState(state)
         temporaryDirectory.mkdirs()
         try {
+                        state = state.copy(detail = "Finalizing camera media")
+            onState(state)
+
+            runCatching {
+                manager.finishTransferBlocking()
+            }.onFailure { error ->
+                android.util.Log.w(
+                    "TuneBudsMediaSync",
+                    "Pre-sync camera cleanup failed",
+                    error,
+                )
+            }
+
+            state = state.copy(detail = "Starting phone hotspot")
+            onState(state)
             val credentials = hotspot.start()
             state = state.copy(detail = "Connecting TuneBuds to phone hotspot")
             onState(state)
