@@ -56,16 +56,22 @@ class TuneBudsLocalHotspot(context: Context) {
                 continuation.invokeOnCancellation { stop() }
                 wifiManager.startLocalOnlyHotspot(
                     object : WifiManager.LocalOnlyHotspotCallback() {
-                        override fun onStarted(startedReservation: WifiManager.LocalOnlyHotspotReservation) {
+                        override fun onStarted(
+                            startedReservation: WifiManager.LocalOnlyHotspotReservation,
+                        ) {
                             if (!continuation.isActive) {
                                 startedReservation.close()
                                 return
                             }
+
                             reservation = startedReservation
                             val credentials = readCredentials(startedReservation)
+
                             if (credentials == null) {
                                 stop()
-                                continuation.resumeWithException(IOException("Android returned empty hotspot credentials"))
+                                continuation.resumeWithException(
+                                    IOException("Android returned empty hotspot credentials"),
+                                )
                             } else {
                                 continuation.resume(credentials)
                             }
@@ -74,14 +80,18 @@ class TuneBudsLocalHotspot(context: Context) {
                         override fun onStopped() {
                             reservation = null
                             if (continuation.isActive) {
-                                continuation.resumeWithException(IOException("Local hotspot stopped before it was ready"))
+                                continuation.resumeWithException(
+                                    IOException("Local hotspot stopped before it was ready"),
+                                )
                             }
                         }
 
                         override fun onFailed(reason: Int) {
                             reservation = null
                             if (continuation.isActive) {
-                                continuation.resumeWithException(IOException("Could not start local hotspot: $reason"))
+                                continuation.resumeWithException(
+                                    IOException("Could not start local hotspot: $reason"),
+                                )
                             }
                         }
                     },
@@ -104,6 +114,7 @@ class TuneBudsLocalHotspot(context: Context) {
         val ssid: String?
         val password: String?
         val channel: Int
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val configuration: SoftApConfiguration = current.softApConfiguration
             ssid = configuration.ssid
@@ -115,8 +126,14 @@ class TuneBudsLocalHotspot(context: Context) {
             password = configuration?.preSharedKey
             channel = 0
         }
+
         if (ssid.isNullOrBlank() || password.isNullOrBlank()) return null
-        return TuneBudsHotspotCredentials(ssid, password, channel.coerceIn(0, 0xFF))
+
+        return TuneBudsHotspotCredentials(
+            ssid,
+            password,
+            channel.coerceIn(0, 0xFF),
+        )
     }
 
     private fun hasWifiPermission(): Boolean {
@@ -162,52 +179,134 @@ class TuneBudsMediaSync(
         onProgress: suspend (TuneBudsMediaItem, Long, Long) -> Unit = { _, _, _ -> },
         onFile: suspend (TuneBudsMediaItem, File) -> Boolean,
     ): Result<Int> {
-        var state = TuneBudsMediaSyncState(detail = "Starting phone hotspot")
+        var state = TuneBudsMediaSyncState(
+            detail = "Finalizing camera media",
+        )
+
         onState(state)
         temporaryDirectory.mkdirs()
+
         try {
-            val credentials = hotspot.start()
-            state = state.copy(detail = "Connecting TuneBuds to phone hotspot")
+            /*
+             * E1749 / TuneBuds fix:
+             *
+             * Before starting the Wi-Fi transfer, explicitly close the
+             * camera subsystem so the glasses have time to finish writing
+             * the most recent photo/video to internal storage.
+             *
+             * Some E1749 firmware revisions otherwise leave the file manager
+             * busy or expose a media entry whose file has not finished saving.
+             */
+            runCatching {
+                manager.finishTransferBlocking()
+            }.onFailure { error ->
+                android.util.Log.w(
+                    "TuneBudsMediaSync",
+                    "Pre-sync camera cleanup failed",
+                    error,
+                )
+            }
+
+            state = state.copy(
+                detail = "Starting phone hotspot",
+            )
             onState(state)
+
+            val credentials = hotspot.start()
+
+            state = state.copy(
+                detail = "Connecting TuneBuds to phone hotspot",
+            )
+            onState(state)
+
             val endpoint = manager.startFileManager(
                 hotspotSsid = credentials.ssid,
                 hotspotPassword = credentials.password,
                 channel = credentials.channel,
-            ) ?: throw IOException("TuneBuds did not report its media server address")
+            ) ?: throw IOException(
+                "TuneBuds did not report its media server address",
+            )
+
             val baseUrl = normalizeBaseUrl(endpoint)
-            state = state.copy(detail = "Reading TuneBuds media list")
+
+            state = state.copy(
+                detail = "Reading TuneBuds media list",
+            )
             onState(state)
+
             val items = fetchManifest(baseUrl)
-            state = state.copy(total = items.size, detail = if (items.isEmpty()) "No pending media" else "Downloading 0/${items.size}")
+
+            state = state.copy(
+                total = items.size,
+                detail = if (items.isEmpty()) {
+                    "No pending media"
+                } else {
+                    "Downloading 0/${items.size}"
+                },
+            )
             onState(state)
 
             var completed = 0
+
             for (item in items) {
                 coroutineContext.ensureActive()
-                val file = download(baseUrl, item, onProgress)
+
+                val file = download(
+                    baseUrl,
+                    item,
+                    onProgress,
+                )
+
                 val imported = try {
                     onFile(item, file)
                 } finally {
                     file.delete()
                 }
-                if (!imported) throw IOException("Could not import ${item.fileName}")
+
+                if (!imported) {
+                    throw IOException(
+                        "Could not import ${item.fileName}",
+                    )
+                }
+
                 completed++
-                state = state.copy(completed = completed, detail = "Downloaded $completed/${items.size}")
+
+                state = state.copy(
+                    completed = completed,
+                    detail = "Downloaded $completed/${items.size}",
+                )
+
                 onState(state)
             }
-            onState(state.copy(detail = "Completed"))
+
+            onState(
+                state.copy(
+                    detail = "Completed",
+                ),
+            )
+
             return Result.success(completed)
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
-            onState(state.copy(detail = "Failed", lastError = error.message ?: error.javaClass.simpleName))
+            onState(
+                state.copy(
+                    detail = "Failed",
+                    lastError = error.message ?: error.javaClass.simpleName,
+                ),
+            )
+
             return Result.failure(error)
         } finally {
             withContext(kotlinx.coroutines.NonCancellable) {
                 try {
                     manager.finishTransferBlocking()
                 } catch (error: Exception) {
-                    android.util.Log.w("TuneBudsMediaSync", "Camera cleanup failed", error)
+                    android.util.Log.w(
+                        "TuneBudsMediaSync",
+                        "Camera cleanup failed",
+                        error,
+                    )
                 } finally {
                     hotspot.stop()
                     temporaryDirectory.deleteRecursively()
@@ -216,109 +315,264 @@ class TuneBudsMediaSync(
         }
     }
 
-    suspend fun fetchManifest(baseUrl: String): List<TuneBudsMediaItem> = withContext(Dispatchers.IO) {
-        parseManifest(getText(normalizeBaseUrl(baseUrl) + "media.config"))
+    suspend fun fetchManifest(
+        baseUrl: String,
+    ): List<TuneBudsMediaItem> = withContext(Dispatchers.IO) {
+        parseManifest(
+            getText(
+                normalizeBaseUrl(baseUrl) + "media.config",
+            ),
+        )
     }
 
-    suspend fun downloadSingle(baseUrl: String, item: TuneBudsMediaItem): File = download(normalizeBaseUrl(baseUrl), item) { _, _, _ -> }
+    suspend fun downloadSingle(
+        baseUrl: String,
+        item: TuneBudsMediaItem,
+    ): File = download(
+        normalizeBaseUrl(baseUrl),
+        item,
+    ) { _, _, _ -> }
 
     fun parseManifest(body: String): List<TuneBudsMediaItem> {
         val trimmed = body.trim()
+
         val names = runCatching {
             when {
-                trimmed.startsWith("[") -> stringsFromArray(JSONArray(trimmed))
-                trimmed.startsWith("{") -> stringsFromArray(JSONObject(trimmed).optJSONArray("files") ?: JSONArray())
+                trimmed.startsWith("[") -> {
+                    stringsFromArray(JSONArray(trimmed))
+                }
+
+                trimmed.startsWith("{") -> {
+                    stringsFromArray(
+                        JSONObject(trimmed)
+                            .optJSONArray("files")
+                            ?: JSONArray(),
+                    )
+                }
+
                 else -> emptyList()
             }
         }.getOrDefault(emptyList()).ifEmpty {
             trimmed.lineSequence()
                 .map(String::trim)
-                .filter { it.isNotBlank() && !it.startsWith("HTTP/") && !it.contains(": ") }
+                .filter {
+                    it.isNotBlank() &&
+                        !it.startsWith("HTTP/") &&
+                        !it.contains(": ")
+                }
                 .toList()
         }
-        return names.mapNotNull(::mediaItem).distinctBy { it.remoteName }
+
+        return names
+            .mapNotNull(::mediaItem)
+            .distinctBy { it.remoteName }
     }
 
     private suspend fun download(
         baseUrl: String,
         item: TuneBudsMediaItem,
-        onProgress: suspend (TuneBudsMediaItem, Long, Long) -> Unit,
+        onProgress: suspend (
+            TuneBudsMediaItem,
+            Long,
+            Long,
+        ) -> Unit,
     ): File = withContext(Dispatchers.IO) {
-        val output = File(temporaryDirectory, item.fileName).apply {
+        val output = File(
+            temporaryDirectory,
+            item.fileName,
+        ).apply {
             parentFile?.mkdirs()
             delete()
         }
-        val request = Request.Builder().url(baseUrl + encodePath(item.remoteName)).get().build()
+
+        val request = Request.Builder()
+            .url(
+                baseUrl + encodePath(
+                    item.remoteName,
+                ),
+            )
+            .get()
+            .build()
+
         CLIENT.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) throw IOException("TuneBuds HTTP ${response.code} for ${item.fileName}")
-            val body = response.body ?: throw IOException("TuneBuds returned no data for ${item.fileName}")
+            if (!response.isSuccessful) {
+                throw IOException(
+                    "TuneBuds HTTP ${response.code} for ${item.fileName}",
+                )
+            }
+
+            val body = response.body
+                ?: throw IOException(
+                    "TuneBuds returned no data for ${item.fileName}",
+                )
+
             val total = body.contentLength()
             var copied = 0L
+
             body.byteStream().use { input ->
-                output.outputStream().buffered(128 * 1024).use { target ->
-                    val buffer = ByteArray(128 * 1024)
-                    while (true) {
-                        coroutineContext.ensureActive()
-                        val count = input.read(buffer)
-                        if (count <= 0) break
-                        target.write(buffer, 0, count)
-                        copied += count
-                        onProgress(item, copied, total)
+                output.outputStream()
+                    .buffered(128 * 1024)
+                    .use { target ->
+
+                        val buffer = ByteArray(
+                            128 * 1024,
+                        )
+
+                        while (true) {
+                            coroutineContext.ensureActive()
+
+                            val count = input.read(buffer)
+
+                            if (count <= 0) break
+
+                            target.write(
+                                buffer,
+                                0,
+                                count,
+                            )
+
+                            copied += count
+
+                            onProgress(
+                                item,
+                                copied,
+                                total,
+                            )
+                        }
                     }
-                }
             }
         }
+
         output
     }
 
     private fun getText(url: String): String {
         val request = Request.Builder()
             .url(url)
-            .header("Connection", "close")
-            .header("User-Agent", "TSClient/1.0")
+            .header(
+                "Connection",
+                "close",
+            )
+            .header(
+                "User-Agent",
+                "TSClient/1.0",
+            )
             .get()
             .build()
+
         CLIENT.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) throw IOException("TuneBuds HTTP ${response.code} for media.config")
-            return response.body?.string() ?: throw IOException("TuneBuds returned an empty media.config")
+            if (!response.isSuccessful) {
+                throw IOException(
+                    "TuneBuds HTTP ${response.code} for media.config",
+                )
+            }
+
+            return response.body?.string()
+                ?: throw IOException(
+                    "TuneBuds returned an empty media.config",
+                )
         }
     }
 
-    private fun stringsFromArray(array: JSONArray): List<String> = buildList {
+    private fun stringsFromArray(
+        array: JSONArray,
+    ): List<String> = buildList {
         for (index in 0 until array.length()) {
             when (val value = array.opt(index)) {
                 is String -> add(value)
-                is JSONObject -> value.optString("name").takeIf(String::isNotBlank)?.let(::add)
+
+                is JSONObject -> {
+                    value.optString("name")
+                        .takeIf(String::isNotBlank)
+                        ?.let(::add)
+                }
             }
         }
     }
 
-    private fun mediaItem(value: String): TuneBudsMediaItem? {
-        val remote = value.trim().replace('\\', '/').trimStart('/')
-        if (remote.isBlank() || remote.contains("../")) return null
+    private fun mediaItem(
+        value: String,
+    ): TuneBudsMediaItem? {
+        val remote = value
+            .trim()
+            .replace('\\', '/')
+            .trimStart('/')
+
+        if (
+            remote.isBlank() ||
+            remote.contains("../")
+        ) {
+            return null
+        }
+
         var fileName = File(remote).name
         val lower = fileName.lowercase()
+
         val type = when {
-            lower.endsWith(".jpg") || lower.endsWith(".jpeg") -> TuneBudsMediaType.PHOTO
-            lower.endsWith(".mp4") || lower.startsWith("video-") -> TuneBudsMediaType.VIDEO
-            lower.endsWith(".opus") || lower.endsWith(".ogg") || lower.endsWith(".wav") -> TuneBudsMediaType.AUDIO
+            lower.endsWith(".jpg") ||
+                lower.endsWith(".jpeg") -> {
+                TuneBudsMediaType.PHOTO
+            }
+
+            lower.endsWith(".mp4") ||
+                lower.startsWith("video-") -> {
+                TuneBudsMediaType.VIDEO
+            }
+
+            lower.endsWith(".opus") ||
+                lower.endsWith(".ogg") ||
+                lower.endsWith(".wav") -> {
+                TuneBudsMediaType.AUDIO
+            }
+
             else -> return null
         }
-        if (type == TuneBudsMediaType.VIDEO && '.' !in fileName) fileName += ".mp4"
-        return TuneBudsMediaItem(remote, fileName, type)
+
+        if (
+            type == TuneBudsMediaType.VIDEO &&
+            '.' !in fileName
+        ) {
+            fileName += ".mp4"
+        }
+
+        return TuneBudsMediaItem(
+            remote,
+            fileName,
+            type,
+        )
     }
 
-    private fun normalizeBaseUrl(value: String): String {
+    private fun normalizeBaseUrl(
+        value: String,
+    ): String {
         val trimmed = value.trim()
-        require(trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+
+        require(
+            trimmed.startsWith("http://") ||
+                trimmed.startsWith("https://"),
+        ) {
             "TuneBuds returned an invalid media server address"
         }
-        return if (trimmed.endsWith('/')) trimmed else "$trimmed/"
+
+        return if (trimmed.endsWith('/')) {
+            trimmed
+        } else {
+            "$trimmed/"
+        }
     }
 
-    private fun encodePath(path: String): String = path.split('/')
+    private fun encodePath(
+        path: String,
+    ): String = path
+        .split('/')
         .filter(String::isNotBlank)
         .joinToString("/") { segment ->
-            URLEncoder.encode(segment, StandardCharsets.UTF_8.name()).replace("+", "%20")
+            URLEncoder.encode(
+                segment,
+                StandardCharsets.UTF_8.name(),
+            ).replace(
+                "+",
+                "%20",
+            )
         }
 }
