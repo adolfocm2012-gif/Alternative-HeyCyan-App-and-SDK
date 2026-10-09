@@ -2,7 +2,6 @@ package com.fersaiyan.cyanbridge.devices.tunebuds
 
 import android.content.Context
 import android.util.Log
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -81,7 +80,9 @@ class TuneBudsManager private constructor(context: Context) {
 
         fun getInstance(context: Context): TuneBudsManager =
             instance ?: synchronized(this) {
-                instance ?: TuneBudsManager(context.applicationContext).also { instance = it }
+                instance ?: TuneBudsManager(context.applicationContext).also {
+                    instance = it
+                }
             }
     }
 
@@ -104,57 +105,94 @@ class TuneBudsManager private constructor(context: Context) {
                     TuneBudsSppState.BONDING -> "Pairing TuneBuds"
                     TuneBudsSppState.CONNECTING -> "Connecting to TuneBuds"
                     TuneBudsSppState.CONNECTED -> "TuneBuds connected"
-                    TuneBudsSppState.ERROR -> _state.value.lastError ?: "TuneBuds connection failed"
+                    TuneBudsSppState.ERROR ->
+                        _state.value.lastError ?: "TuneBuds connection failed"
                 }
+
                 _state.value = _state.value.copy(
                     connectionLabel = label,
                     protocolState = transportState.name,
-                    isVideoRecording = if (transportState == TuneBudsSppState.CONNECTED) {
-                        _state.value.isVideoRecording
-                    } else {
-                        false
-                    },
-                    isAudioRecording = if (transportState == TuneBudsSppState.CONNECTED) {
-                        _state.value.isAudioRecording
-                    } else {
-                        false
-                    },
+                    isVideoRecording =
+                        if (transportState == TuneBudsSppState.CONNECTED) {
+                            _state.value.isVideoRecording
+                        } else {
+                            false
+                        },
+                    isAudioRecording =
+                        if (transportState == TuneBudsSppState.CONNECTED) {
+                            _state.value.isAudioRecording
+                        } else {
+                            false
+                        },
                 )
             }
         }
-        scope.launch { client.frames.collect(::handleFrame) }
+
+        scope.launch {
+            client.frames.collect(::handleFrame)
+        }
     }
 
     @Synchronized
-    fun connect(address: String, deviceName: String? = null) {
+    fun connect(
+        address: String,
+        deviceName: String? = null,
+    ) {
         val normalizedAddress = address.trim()
+
         if (normalizedAddress.isBlank()) {
             updateError("No TuneBuds Bluetooth address was selected")
             return
         }
-        val sameAddress = _state.value.deviceAddress.equals(normalizedAddress, ignoreCase = true)
-        if (sameAddress && (client.isConnected() || connectJob?.isActive == true)) {
+
+        val sameAddress =
+            _state.value.deviceAddress.equals(
+                normalizedAddress,
+                ignoreCase = true,
+            )
+
+        if (
+            sameAddress &&
+            (
+                client.isConnected() ||
+                connectJob?.isActive == true
+            )
+        ) {
             return
         }
+
         connectJob?.cancel()
+
         _state.value = TuneBudsState(
             connectionLabel = "Connecting to TuneBuds",
             protocolState = TuneBudsSppState.CONNECTING.name,
             deviceAddress = normalizedAddress,
             deviceName = deviceName,
         )
+
         connectJob = scope.launch {
-            client.connect(normalizedAddress).getOrElse { error ->
-                updateError(error.message ?: "TuneBuds connection failed")
-                return@launch
-            }
+            client.connect(normalizedAddress)
+                .getOrElse { error ->
+                    updateError(
+                        error.message
+                            ?: "TuneBuds connection failed",
+                    )
+                    return@launch
+                }
+
             _state.value = _state.value.copy(
                 connectionLabel = "TuneBuds connected",
                 protocolState = TuneBudsSppState.CONNECTED.name,
                 lastError = null,
             )
-            runCatching { initializeProtocol() }
-                .onFailure { error -> updateError("TuneBuds status initialization failed: ${error.message}") }
+
+            runCatching {
+                initializeProtocol()
+            }.onFailure { error ->
+                updateError(
+                    "TuneBuds status initialization failed: ${error.message}",
+                )
+            }
         }
     }
 
@@ -164,104 +202,214 @@ class TuneBudsManager private constructor(context: Context) {
         client.disconnect()
     }
 
-    fun isConnected(): Boolean = client.isConnected()
+    fun isConnected(): Boolean =
+        client.isConnected()
 
-    fun takePhoto() = launchCommand("take photo") {
-        requireSuccess(request(TuneBudsProtocol.CMD_CAMERA_ON, byteArrayOf(0)))
-    }
+    fun takePhoto() =
+        launchCommand("take photo") {
+            requireSuccess(
+                request(
+                    TuneBudsProtocol.CMD_CAMERA_ON,
+                    byteArrayOf(0),
+                ),
+            )
+        }
 
     suspend fun takePhotoBlocking() {
-        requireSuccess(request(TuneBudsProtocol.CMD_CAMERA_ON, byteArrayOf(0)))
+        requireSuccess(
+            request(
+                TuneBudsProtocol.CMD_CAMERA_ON,
+                byteArrayOf(0),
+            ),
+        )
+
         delay(2_500L)
         stopCameraSubsystem()
     }
 
-    suspend fun capturePhotoForAi(timeoutMs: Long = 15_000L): ByteArray? = coroutineScope {
-        if (!client.isConnected()) return@coroutineScope null
-        synchronized(aiPictureBuffer) { aiPictureBuffer.reset() }
-        val photo = async(start = CoroutineStart.UNDISPATCHED) { aiPhotos.first() }
+    suspend fun capturePhotoForAi(
+        timeoutMs: Long = 15_000L,
+    ): ByteArray? = coroutineScope {
+        if (!client.isConnected()) {
+            return@coroutineScope null
+        }
+
+        synchronized(aiPictureBuffer) {
+            aiPictureBuffer.reset()
+        }
+
+        val photo =
+            async(start = CoroutineStart.UNDISPATCHED) {
+                aiPhotos.first()
+            }
+
         try {
-            requireSuccess(request(TuneBudsProtocol.CMD_CAMERA_ON, byteArrayOf(1)))
-            withTimeoutOrNull(timeoutMs) { photo.await() }
+            requireSuccess(
+                request(
+                    TuneBudsProtocol.CMD_CAMERA_ON,
+                    byteArrayOf(1),
+                ),
+            )
+
+            withTimeoutOrNull(timeoutMs) {
+                photo.await()
+            }
         } finally {
             photo.cancel()
         }
     }
 
-    fun toggleVideo() = launchCommand("toggle video recording") {
-        if (_state.value.isVideoRecording) {
-            stopCameraSubsystem()
-        } else {
-            requireSuccess(request(TuneBudsProtocol.CMD_START_VIDEO))
-            _state.value = _state.value.copy(isVideoRecording = true, isAudioRecording = false)
+    fun toggleVideo() =
+        launchCommand("toggle video recording") {
+            if (_state.value.isVideoRecording) {
+                stopCameraSubsystem()
+            } else {
+                requireSuccess(
+                    request(
+                        TuneBudsProtocol.CMD_START_VIDEO,
+                    ),
+                )
+
+                _state.value =
+                    _state.value.copy(
+                        isVideoRecording = true,
+                        isAudioRecording = false,
+                    )
+            }
         }
-    }
 
-    fun toggleAudio() = launchCommand("toggle audio recording") {
-        if (_state.value.isAudioRecording) {
-            stopCameraSubsystem()
-        } else {
-            requireSuccess(request(TuneBudsProtocol.CMD_START_AUDIO))
-            _state.value = _state.value.copy(isAudioRecording = true, isVideoRecording = false)
+    fun toggleAudio() =
+        launchCommand("toggle audio recording") {
+            if (_state.value.isAudioRecording) {
+                stopCameraSubsystem()
+            } else {
+                requireSuccess(
+                    request(
+                        TuneBudsProtocol.CMD_START_AUDIO,
+                    ),
+                )
+
+                _state.value =
+                    _state.value.copy(
+                        isAudioRecording = true,
+                        isVideoRecording = false,
+                    )
+            }
         }
-    }
 
-    fun requestBattery() = launchCommand("read battery") {
-        requestDeviceInfo(TuneBudsProtocol.INFO_BATTERY)
-    }
-
-    fun requestVersion() = launchCommand("read versions") {
-        requestDeviceInfo(
-            TuneBudsProtocol.INFO_FIRMWARE_VERSION,
-            TuneBudsProtocol.INFO_MODEL,
-            TuneBudsProtocol.INFO_SERIAL_NUMBER,
-        )
-        requireSuccess(request(TuneBudsProtocol.CMD_COPROCESSOR_VERSION))
-        runCatching { requestCapabilityInfo() }
-            .onFailure { Log.w(TAG, "Optional TuneBuds capability query failed", it) }
-    }
-
-    fun requestCapabilities() = launchCommand("read capabilities") {
-        requestCapabilityInfo()
-    }
-
-    fun requestStorage() = launchCommand("read storage") {
-        requireSuccess(request(TuneBudsProtocol.CMD_STORAGE))
-    }
-
-    fun requestMediaCount() = launchCommand("read media count") {
-        requireSuccess(request(TuneBudsProtocol.CMD_MEDIA_COUNTS))
-    }
-
-    fun requestWorkState() = launchCommand("read work state") {
-        val response = request(TuneBudsProtocol.CMD_WORK_STATE)
-        TuneBudsProtocol.parseStatus(response.payload)?.let { state ->
-            _state.value = _state.value.copy(workState = state, lastError = null)
+    fun requestBattery() =
+        launchCommand("read battery") {
+            requestDeviceInfo(
+                TuneBudsProtocol.INFO_BATTERY,
+            )
         }
-    }
 
-    fun syncTime() = launchCommand("sync time") {
-        requireSuccess(
-            request(
-                TuneBudsProtocol.CMD_SET_TIME,
-                TuneBudsProtocol.buildSetTimePayload(),
-            ),
-        )
-    }
+    fun requestVersion() =
+        launchCommand("read versions") {
+            requestDeviceInfo(
+                TuneBudsProtocol.INFO_FIRMWARE_VERSION,
+                TuneBudsProtocol.INFO_MODEL,
+                TuneBudsProtocol.INFO_SERIAL_NUMBER,
+            )
 
-    fun refreshStatus() = launchCommand("refresh status") {
-        requestDeviceInfo(
-            TuneBudsProtocol.INFO_BATTERY,
-            TuneBudsProtocol.INFO_FIRMWARE_VERSION,
-            TuneBudsProtocol.INFO_MODEL,
-            TuneBudsProtocol.INFO_SERIAL_NUMBER,
-            TuneBudsProtocol.INFO_WIFI_SUPPORT,
-        )
-        requestCapabilityInfo()
-        requireSuccess(request(TuneBudsProtocol.CMD_STORAGE))
-        requireSuccess(request(TuneBudsProtocol.CMD_MEDIA_COUNTS))
-        requireSuccess(request(TuneBudsProtocol.CMD_COPROCESSOR_VERSION))
-    }
+            requireSuccess(
+                request(
+                    TuneBudsProtocol.CMD_COPROCESSOR_VERSION,
+                ),
+            )
+
+            runCatching {
+                requestCapabilityInfo()
+            }.onFailure {
+                Log.w(
+                    TAG,
+                    "Optional TuneBuds capability query failed",
+                    it,
+                )
+            }
+        }
+
+    fun requestCapabilities() =
+        launchCommand("read capabilities") {
+            requestCapabilityInfo()
+        }
+
+    fun requestStorage() =
+        launchCommand("read storage") {
+            requireSuccess(
+                request(
+                    TuneBudsProtocol.CMD_STORAGE,
+                ),
+            )
+        }
+
+    fun requestMediaCount() =
+        launchCommand("read media count") {
+            requireSuccess(
+                request(
+                    TuneBudsProtocol.CMD_MEDIA_COUNTS,
+                ),
+            )
+        }
+
+    fun requestWorkState() =
+        launchCommand("read work state") {
+            val response =
+                request(
+                    TuneBudsProtocol.CMD_WORK_STATE,
+                )
+
+            TuneBudsProtocol
+                .parseStatus(response.payload)
+                ?.let { state ->
+                    _state.value =
+                        _state.value.copy(
+                            workState = state,
+                            lastError = null,
+                        )
+                }
+        }
+
+    fun syncTime() =
+        launchCommand("sync time") {
+            requireSuccess(
+                request(
+                    TuneBudsProtocol.CMD_SET_TIME,
+                    TuneBudsProtocol.buildSetTimePayload(),
+                ),
+            )
+        }
+
+    fun refreshStatus() =
+        launchCommand("refresh status") {
+            requestDeviceInfo(
+                TuneBudsProtocol.INFO_BATTERY,
+                TuneBudsProtocol.INFO_FIRMWARE_VERSION,
+                TuneBudsProtocol.INFO_MODEL,
+                TuneBudsProtocol.INFO_SERIAL_NUMBER,
+                TuneBudsProtocol.INFO_WIFI_SUPPORT,
+            )
+
+            requestCapabilityInfo()
+
+            requireSuccess(
+                request(
+                    TuneBudsProtocol.CMD_STORAGE,
+                ),
+            )
+
+            requireSuccess(
+                request(
+                    TuneBudsProtocol.CMD_MEDIA_COUNTS,
+                ),
+            )
+
+            requireSuccess(
+                request(
+                    TuneBudsProtocol.CMD_COPROCESSOR_VERSION,
+                ),
+            )
+        }
 
     suspend fun startFileManager(
         hotspotSsid: String,
@@ -269,142 +417,240 @@ class TuneBudsManager private constructor(context: Context) {
         channel: Int = 0,
         timeoutMs: Long = 30_000L,
     ): String? = coroutineScope {
-        if (!client.isConnected()) return@coroutineScope null
 
-        val modes = intArrayOf(2, 1, 0)
-        var lastError: Throwable? = null
+        if (!client.isConnected()) {
+            return@coroutineScope null
+        }
 
-        for (mode in modes) {
-            _state.value = _state.value.copy(
+        _state.value =
+            _state.value.copy(
                 mediaBaseUrl = null,
                 wifiState = null,
                 lastError = null,
             )
 
-            Log.i(TAG, "Trying TuneBuds Wi-Fi media mode=$mode")
+        /*
+         * E1749 diagnostic:
+         *
+         * The official AB Mate / TuneBuds path uses Wi-Fi mode 0.
+         * We watch Wi-Fi failure notifications at the same time
+         * that we wait for the HTTP media-server endpoint.
+         */
 
-            try {
-                requireSuccess(
-                    request(
-                        TuneBudsProtocol.CMD_CONFIGURE_WIFI,
-                        TuneBudsProtocol.buildWifiPayload(
-                            mode = mode,
-                            ssid = hotspotSsid,
-                            password = hotspotPassword,
-                            channel = channel,
-                        ),
-                    ),
-                )
+        val wifiFailure =
+            launch(start = CoroutineStart.UNDISPATCHED) {
 
-                var fileManagerAttempt = 1
-
-                while (true) {
-                    val response = request(TuneBudsProtocol.CMD_FILE_MANAGER)
-
-                    when (val status = TuneBudsProtocol.parseStatus(response.payload)) {
-                        0 -> break
-
-                        1, 3, 5 -> {
-                            if (fileManagerAttempt >= FILE_MANAGER_MAX_ATTEMPTS) {
-                                throw IOException(
-                                    "TuneBuds file manager remained busy for ${FILE_MANAGER_MAX_ATTEMPTS}s in Wi-Fi mode $mode",
-                                )
-                            }
-
-                            Log.i(
-                                TAG,
-                                "TuneBuds file manager busy status=$status mode=$mode attempt=$fileManagerAttempt",
-                            )
-
-                            fileManagerAttempt++
-                            delay(FILE_MANAGER_RETRY_MS)
-                        }
-
-                        null -> {
-                            throw IOException(
-                                "TuneBuds file manager returned no status in Wi-Fi mode $mode",
-                            )
-                        }
-
-                        else -> {
-                            throw IOException(
-                                "TuneBuds file manager failed with status $status in Wi-Fi mode $mode",
-                            )
-                        }
+                val failed =
+                    state.first {
+                        it.wifiState in setOf(
+                            0,
+                            4,
+                            5,
+                        )
                     }
-                }
-
-                val result = withTimeoutOrNull(timeoutMs) {
-                    state.first { snapshot ->
-                        !snapshot.mediaBaseUrl.isNullOrBlank() ||
-                            snapshot.wifiState in setOf(0, 4, 5)
-                    }
-                } ?: throw IOException(
-                    "TuneBuds Wi-Fi mode $mode timed out waiting for media server",
-                )
-
-                val endpoint = result.mediaBaseUrl
-
-                if (!endpoint.isNullOrBlank()) {
-                    Log.i(
-                        TAG,
-                        "TuneBuds media server available in Wi-Fi mode $mode: $endpoint",
-                    )
-                    return@coroutineScope endpoint
-                }
 
                 throw IOException(
-                    "TuneBuds Wi-Fi mode $mode failed (state ${result.wifiState})",
+                    "TuneBuds Wi-Fi connection failed " +
+                        "(state ${failed.wifiState})",
                 )
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Throwable) {
-                lastError = error
-
-                Log.w(
-                    TAG,
-                    "TuneBuds Wi-Fi media mode $mode failed, trying next mode",
-                    error,
-                )
-
-                delay(1_000L)
             }
+
+        val endpoint =
+            async(start = CoroutineStart.UNDISPATCHED) {
+
+                state
+                    .filter {
+                        !it.mediaBaseUrl
+                            .isNullOrBlank()
+                    }
+                    .first()
+                    .mediaBaseUrl
+            }
+
+        try {
+
+            Log.i(
+                TAG,
+                "E1749: sending Wi-Fi credentials, mode=0, channel=$channel",
+            )
+
+            requireSuccess(
+                request(
+                    TuneBudsProtocol.CMD_CONFIGURE_WIFI,
+                    TuneBudsProtocol.buildWifiPayload(
+                        mode = 0,
+                        ssid = hotspotSsid,
+                        password = hotspotPassword,
+                        channel = channel,
+                    ),
+                ),
+            )
+
+            Log.i(
+                TAG,
+                "E1749: Wi-Fi credentials accepted",
+            )
+
+            var fileManagerAttempt = 1
+
+            while (true) {
+
+                Log.i(
+                    TAG,
+                    "E1749: requesting file manager, attempt=$fileManagerAttempt",
+                )
+
+                val response =
+                    request(
+                        TuneBudsProtocol.CMD_FILE_MANAGER,
+                    )
+
+                when (
+                    val status =
+                        TuneBudsProtocol.parseStatus(
+                            response.payload,
+                        )
+                ) {
+
+                    0 -> {
+                        Log.i(
+                            TAG,
+                            "E1749: file manager accepted",
+                        )
+                        break
+                    }
+
+                    1,
+                    3,
+                    5,
+                    -> {
+
+                        Log.i(
+                            TAG,
+                            "E1749: file manager busy " +
+                                "status=$status " +
+                                "attempt=$fileManagerAttempt",
+                        )
+
+                        if (
+                            fileManagerAttempt >=
+                            FILE_MANAGER_MAX_ATTEMPTS
+                        ) {
+                            throw IOException(
+                                "TuneBuds file manager remained busy " +
+                                    "after $FILE_MANAGER_MAX_ATTEMPTS attempts",
+                            )
+                        }
+
+                        fileManagerAttempt++
+
+                        delay(
+                            FILE_MANAGER_RETRY_MS,
+                        )
+                    }
+
+                    null -> {
+                        throw IOException(
+                            "TuneBuds file manager returned no status",
+                        )
+                    }
+
+                    else -> {
+                        throw IOException(
+                            "TuneBuds file manager failed " +
+                                "with status $status",
+                        )
+                    }
+                }
+            }
+
+            Log.i(
+                TAG,
+                "E1749: waiting for media server address",
+            )
+
+            val mediaUrl =
+                withTimeoutOrNull(timeoutMs) {
+                    endpoint.await()
+                }
+
+            if (mediaUrl.isNullOrBlank()) {
+                throw IOException(
+                    "TuneBuds did not report its media server " +
+                        "address within ${timeoutMs / 1000}s",
+                )
+            }
+
+            Log.i(
+                TAG,
+                "E1749: media server available: $mediaUrl",
+            )
+
+            mediaUrl
+
+        } finally {
+
+            wifiFailure.cancel()
+            endpoint.cancel()
         }
-
-        throw (
-            lastError
-                ?: IOException("TuneBuds could not start its media server in any Wi-Fi mode")
-        )
     }
 
-    fun finishTransfer() = launchCommand("close camera subsystem") {
-        stopCameraSubsystem()
-    }
+    fun finishTransfer() =
+        launchCommand(
+            "close camera subsystem",
+        ) {
+            stopCameraSubsystem()
+        }
 
     suspend fun finishTransferBlocking() {
         stopCameraSubsystem()
     }
 
     private suspend fun initializeProtocol() {
-        val capabilities = requestDeviceInfo(
-            TuneBudsProtocol.INFO_MAX_PACKET_SIZE,
-            TuneBudsProtocol.INFO_AI_KIT_SUPPORT,
-        )
-        capabilities[TuneBudsProtocol.INFO_MAX_PACKET_SIZE]
+
+        val capabilities =
+            requestDeviceInfo(
+                TuneBudsProtocol.INFO_MAX_PACKET_SIZE,
+                TuneBudsProtocol.INFO_AI_KIT_SUPPORT,
+            )
+
+        capabilities[
+            TuneBudsProtocol.INFO_MAX_PACKET_SIZE
+        ]
             ?.firstOrNull()
             ?.toInt()
             ?.and(0xFF)
-            ?.takeIf { it > TuneBudsProtocol.HEADER_SIZE }
-            ?.let { packetSize ->
-                client.setMaxPacketSize(packetSize)
-                _state.value = _state.value.copy(protocolPacketSize = packetSize)
+            ?.takeIf {
+                it >
+                    TuneBudsProtocol.HEADER_SIZE
             }
-        val aiKitSupport = capabilities[TuneBudsProtocol.INFO_AI_KIT_SUPPORT]
-            ?.firstOrNull()
-            ?.toInt()
-            ?.and(0xFF)
-            ?: 1
-        _state.value = _state.value.copy(aiKitSupport = aiKitSupport)
+            ?.let { packetSize ->
+
+                client.setMaxPacketSize(
+                    packetSize,
+                )
+
+                _state.value =
+                    _state.value.copy(
+                        protocolPacketSize =
+                            packetSize,
+                    )
+            }
+
+        val aiKitSupport =
+            capabilities[
+                TuneBudsProtocol.INFO_AI_KIT_SUPPORT
+            ]
+                ?.firstOrNull()
+                ?.toInt()
+                ?.and(0xFF)
+                ?: 1
+
+        _state.value =
+            _state.value.copy(
+                aiKitSupport =
+                    aiKitSupport,
+            )
 
         requestDeviceInfo(
             TuneBudsProtocol.INFO_BATTERY,
@@ -416,18 +662,56 @@ class TuneBudsManager private constructor(context: Context) {
             TuneBudsProtocol.INFO_SUPPORT_DETECTION,
             TuneBudsProtocol.INFO_WIFI_SUPPORT,
         )
-        runCatching { requestCapabilityInfo() }
-            .onFailure { Log.w(TAG, "Optional TuneBuds capability query failed", it) }
-        requireSuccess(request(TuneBudsProtocol.CMD_COPROCESSOR_VERSION))
-        requireSuccess(request(TuneBudsProtocol.CMD_STORAGE))
-        requireSuccess(request(TuneBudsProtocol.CMD_MEDIA_COUNTS))
-        val workState = request(TuneBudsProtocol.CMD_WORK_STATE)
-        TuneBudsProtocol.parseStatus(workState.payload)?.let { value ->
-            _state.value = _state.value.copy(workState = value)
+
+        runCatching {
+            requestCapabilityInfo()
+        }.onFailure {
+
+            Log.w(
+                TAG,
+                "Optional TuneBuds capability query failed",
+                it,
+            )
         }
+
+        requireSuccess(
+            request(
+                TuneBudsProtocol.CMD_COPROCESSOR_VERSION,
+            ),
+        )
+
+        requireSuccess(
+            request(
+                TuneBudsProtocol.CMD_STORAGE,
+            ),
+        )
+
+        requireSuccess(
+            request(
+                TuneBudsProtocol.CMD_MEDIA_COUNTS,
+            ),
+        )
+
+        val workState =
+            request(
+                TuneBudsProtocol.CMD_WORK_STATE,
+            )
+
+        TuneBudsProtocol
+            .parseStatus(
+                workState.payload,
+            )
+            ?.let { value ->
+
+                _state.value =
+                    _state.value.copy(
+                        workState = value,
+                    )
+            }
     }
 
     private suspend fun requestCapabilityInfo() {
+
         requestDeviceInfo(
             TuneBudsProtocol.INFO_DEVICE_ABILITY,
             TuneBudsProtocol.INFO_SUPPORT_DETECTION,
@@ -442,247 +726,913 @@ class TuneBudsManager private constructor(context: Context) {
             TuneBudsProtocol.INFO_AI_CHAT_SUPPORT,
             TuneBudsProtocol.INFO_SUPPORT_APP_LIST,
         )
-        val cameraInfo = request(TuneBudsProtocol.CMD_CAMERA_COPROCESSOR_INFO)
-        TuneBudsProtocol.parseStatus(cameraInfo.payload)?.let { type ->
-            _state.value = _state.value.copy(cameraCoprocessorType = type, lastError = null)
-        }
+
+        val cameraInfo =
+            request(
+                TuneBudsProtocol.CMD_CAMERA_COPROCESSOR_INFO,
+            )
+
+        TuneBudsProtocol
+            .parseStatus(
+                cameraInfo.payload,
+            )
+            ?.let { type ->
+
+                _state.value =
+                    _state.value.copy(
+                        cameraCoprocessorType =
+                            type,
+                        lastError = null,
+                    )
+            }
     }
 
-    private suspend fun requestDeviceInfo(vararg types: Int): Map<Int, ByteArray> {
-        val response = request(
-            TuneBudsProtocol.CMD_DEVICE_INFO,
-            TuneBudsProtocol.deviceInfoQuery(*types),
-        )
-        return TuneBudsProtocol.parseDeviceInfo(response.payload).also(::applyDeviceInfo)
+    private suspend fun requestDeviceInfo(
+        vararg types: Int,
+    ): Map<Int, ByteArray> {
+
+        val response =
+            request(
+                TuneBudsProtocol.CMD_DEVICE_INFO,
+                TuneBudsProtocol.deviceInfoQuery(
+                    *types,
+                ),
+            )
+
+        return TuneBudsProtocol
+            .parseDeviceInfo(
+                response.payload,
+            )
+            .also(
+                ::applyDeviceInfo,
+            )
     }
 
     private suspend fun request(
         command: Int,
-        payload: ByteArray = byteArrayOf(),
-    ): TuneBudsFrame = requestMutex.withLock {
-        coroutineScope {
-            val response = async(start = CoroutineStart.UNDISPATCHED) {
-                withTimeout(REQUEST_TIMEOUT_MS) {
-                    client.frames
-                        .filter { it.type == TuneBudsFrameType.RESPONSE && it.command == command }
-                        .first()
+        payload: ByteArray =
+            byteArrayOf(),
+    ): TuneBudsFrame =
+        requestMutex.withLock {
+
+            coroutineScope {
+
+                val response =
+                    async(
+                        start =
+                            CoroutineStart.UNDISPATCHED,
+                    ) {
+
+                        withTimeout(
+                            REQUEST_TIMEOUT_MS,
+                        ) {
+
+                            client.frames
+                                .filter {
+                                    it.type ==
+                                        TuneBudsFrameType.RESPONSE &&
+                                        it.command ==
+                                        command
+                                }
+                                .first()
+                        }
+                    }
+
+                try {
+
+                    client.send(
+                        command,
+                        payload,
+                    ).getOrThrow()
+
+                    response.await()
+
+                } catch (
+                    error: Throwable
+                ) {
+
+                    response.cancel()
+                    throw error
                 }
             }
-            try {
-                client.send(command, payload).getOrThrow()
-                response.await()
-            } catch (error: Throwable) {
-                response.cancel()
-                throw error
-            }
         }
-    }
 
     private suspend fun stopCameraSubsystem() {
-        repeat(CAMERA_CLOSE_MAX_ATTEMPTS) { attempt ->
-            val response = request(TuneBudsProtocol.CMD_CAMERA_CLOSE)
-            when (val status = TuneBudsProtocol.parseStatus(response.payload)) {
+
+        repeat(
+            CAMERA_CLOSE_MAX_ATTEMPTS,
+        ) { attempt ->
+
+            val response =
+                request(
+                    TuneBudsProtocol.CMD_CAMERA_CLOSE,
+                )
+
+            when (
+                val status =
+                    TuneBudsProtocol.parseStatus(
+                        response.payload,
+                    )
+            ) {
+
                 0 -> {
-                    _state.value = _state.value.copy(isVideoRecording = false, isAudioRecording = false)
+
+                    _state.value =
+                        _state.value.copy(
+                            isVideoRecording =
+                                false,
+                            isAudioRecording =
+                                false,
+                        )
+
                     return
                 }
+
                 1 -> {
-                    // The recording has stopped, but the camera subsystem is still saving it.
-                    if (attempt < CAMERA_CLOSE_MAX_ATTEMPTS - 1) delay(CAMERA_CLOSE_RETRY_MS)
-                }
-                2 -> throw IOException("TuneBuds camera is busy transferring media")
-                3 -> throw IOException("TuneBuds camera is busy updating")
-                null -> throw IOException("TuneBuds camera close returned no status")
-                else -> throw IOException("TuneBuds camera close failed with status $status")
-            }
-        }
-        throw IOException("TuneBuds camera was still saving after ${CAMERA_CLOSE_MAX_ATTEMPTS}s")
-    }
 
-    private fun requireSuccess(response: TuneBudsFrame) {
-        val status = TuneBudsProtocol.parseStatus(response.payload)
-            ?: throw IOException("TuneBuds command 0x${response.command.toString(16)} returned no status")
-        if (status != 0) {
-            throw IOException("TuneBuds command 0x${response.command.toString(16)} failed with status $status")
-        }
-    }
+                    /*
+                     * Recording has stopped,
+                     * but the camera is still
+                     * finishing the file.
+                     */
 
-    private fun handleFrame(frame: TuneBudsFrame) {
-        when (frame.command) {
-            TuneBudsProtocol.CMD_WIFI_STATE -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
-                TuneBudsProtocol.parseStatus(frame.payload)?.let { value ->
-                    _state.value = _state.value.copy(wifiState = value)
+                    if (
+                        attempt <
+                        CAMERA_CLOSE_MAX_ATTEMPTS -
+                        1
+                    ) {
+                        delay(
+                            CAMERA_CLOSE_RETRY_MS,
+                        )
+                    }
                 }
-            }
-            TuneBudsProtocol.CMD_DEVICE_INFO -> if (frame.type == TuneBudsFrameType.RESPONSE) {
-                runCatching { TuneBudsProtocol.parseDeviceInfo(frame.payload) }
-                    .onSuccess(::applyDeviceInfo)
-                    .onFailure { Log.w(TAG, "Invalid device-info response", it) }
-            }
-            TuneBudsProtocol.INFO_BATTERY -> TuneBudsProtocol.parseBattery(frame.payload)?.let(::applyBattery)
-            TuneBudsProtocol.CMD_AI_PICTURE -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
-                handleAiPicture(frame.payload)
-            }
-            TuneBudsProtocol.CMD_COPROCESSOR_VERSION -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
-                TuneBudsProtocol.parseString(frame.payload)?.let { version ->
-                    _state.value = _state.value.copy(coprocessorVersion = version, lastError = null)
-                }
-            }
-            TuneBudsProtocol.CMD_CAMERA_COPROCESSOR_INFO -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
-                TuneBudsProtocol.parseStatus(frame.payload)?.let { type ->
-                    _state.value = _state.value.copy(cameraCoprocessorType = type, lastError = null)
-                }
-            }
-            TuneBudsProtocol.CMD_STORAGE -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
-                TuneBudsProtocol.parseStorage(frame.payload)?.let { storage ->
-                    _state.value = _state.value.copy(storage = storage, lastError = null)
-                }
-            }
-            TuneBudsProtocol.CMD_FILE_MANAGER -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
-                TuneBudsProtocol.parseString(frame.payload)?.let { endpoint ->
-                    _state.value = _state.value.copy(mediaBaseUrl = endpoint, lastError = null)
-                }
-            }
-            TuneBudsProtocol.CMD_MEDIA_COUNTS -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
-                TuneBudsProtocol.parseMediaCounts(frame.payload)?.let { counts ->
-                    _state.value = _state.value.copy(mediaCounts = counts, lastError = null)
-                }
-            }
-            TuneBudsProtocol.CMD_WORK_STATE -> TuneBudsProtocol.parseStatus(frame.payload)?.let { value ->
-                _state.value = _state.value.copy(workState = value, lastError = null)
-            }
-        }
-    }
 
-    private fun applyDeviceInfo(info: Map<Int, ByteArray>) {
-        var current = _state.value
-        info[TuneBudsProtocol.INFO_BATTERY]?.let { payload ->
-            TuneBudsProtocol.parseBattery(payload)?.let { battery ->
-                current = current.copy(
-                    batteryPercent = battery.percent.coerceIn(0, 100),
-                    isCharging = battery.isCharging,
-                )
-            }
-        }
-        info[TuneBudsProtocol.INFO_FIRMWARE_VERSION]?.let { payload ->
-            TuneBudsProtocol.parseFirmwareVersion(payload)?.let { current = current.copy(firmwareVersion = it) }
-        }
-        info[TuneBudsProtocol.INFO_MODEL]?.let { payload ->
-            TuneBudsProtocol.parseString(payload)?.let { current = current.copy(model = it) }
-        }
-        info[TuneBudsProtocol.INFO_SERIAL_NUMBER]?.let { payload ->
-            TuneBudsProtocol.parseString(payload)?.let { current = current.copy(serialNumber = it) }
-        }
-        info[TuneBudsProtocol.INFO_DEVICE_ABILITY]?.let { payload ->
-            current = current.copy(deviceAbility = payload.copyOf())
-            TuneBudsProtocol.parseDeviceCapabilities(payload)?.let {
-                current = current.copy(deviceCapabilityMask = it)
-            }
-        }
-        info[TuneBudsProtocol.INFO_SUPPORT_DETECTION]?.let { payload ->
-            TuneBudsProtocol.parseUnsignedValue(payload)?.let {
-                current = current.copy(supportDetection = it)
-            }
-        }
-        info[TuneBudsProtocol.INFO_SUPPORT_AUDIO]?.let { payload ->
-            TuneBudsProtocol.parseUnsignedValue(payload)?.let {
-                current = current.copy(supportAudio = it)
-            }
-        }
-        info[TuneBudsProtocol.INFO_VIDEO_LIMIT]?.let { payload ->
-            TuneBudsProtocol.parseUnsignedValue(payload)?.let {
-                current = current.copy(videoLimitSeconds = it)
-            }
-        }
-        info[TuneBudsProtocol.INFO_AUDIO_LIMIT]?.let { payload ->
-            TuneBudsProtocol.parseUnsignedValue(payload)?.let {
-                current = current.copy(audioLimitSeconds = it)
-            }
-        }
-        info[TuneBudsProtocol.INFO_SUPPORT_VOLUME_CONTROL]?.let { payload ->
-            TuneBudsProtocol.parseUnsignedValue(payload)?.let {
-                current = current.copy(supportVolumeControl = it)
-            }
-        }
-        info[TuneBudsProtocol.INFO_CURRENT_VOLUME]?.let { payload ->
-            current = current.copy(currentVolume = payload.map { it.toInt() and 0xFF })
-        }
-        info[TuneBudsProtocol.INFO_SCREEN_CONFIG]?.let { payload ->
-            TuneBudsProtocol.parseScreenConfig(payload)?.let {
-                current = current.copy(screenConfig = it)
-            }
-        }
-        info[TuneBudsProtocol.INFO_RESOLUTION]?.let { payload ->
-            TuneBudsProtocol.parseUnsignedValue(payload)?.let {
-                current = current.copy(resolution = it)
-            }
-        }
-        info[TuneBudsProtocol.INFO_SUPPORT_OPUS]?.let { payload ->
-            TuneBudsProtocol.parseUnsignedValue(payload)?.let {
-                current = current.copy(supportOpus = it)
-            }
-        }
-        info[TuneBudsProtocol.INFO_AI_CHAT_SUPPORT]?.let { payload ->
-            TuneBudsProtocol.parseUnsignedValue(payload)?.let {
-                current = current.copy(supportAiChat = it)
-            }
-        }
-        info[TuneBudsProtocol.INFO_SUPPORT_APP_LIST]?.let { payload ->
-            TuneBudsProtocol.parseUnsignedValue(payload)?.let {
-                current = current.copy(supportAppList = it)
-            }
-        }
-        info[TuneBudsProtocol.INFO_WIFI_SUPPORT]?.firstOrNull()?.let { value ->
-            current = current.copy(wifiSupportMask = value.toInt() and 0xFF)
-        }
-        _state.value = current.copy(lastError = null)
-    }
+                2 -> {
+                    throw IOException(
+                        "TuneBuds camera is busy transferring media",
+                    )
+                }
 
-    private fun applyBattery(battery: TuneBudsBattery) {
-        _state.value = _state.value.copy(
-            batteryPercent = battery.percent.coerceIn(0, 100),
-            isCharging = battery.isCharging,
-            lastError = null,
+                3 -> {
+                    throw IOException(
+                        "TuneBuds camera is busy updating",
+                    )
+                }
+
+                null -> {
+                    throw IOException(
+                        "TuneBuds camera close returned no status",
+                    )
+                }
+
+                else -> {
+                    throw IOException(
+                        "TuneBuds camera close failed with status $status",
+                    )
+                }
+            }
+        }
+
+        throw IOException(
+            "TuneBuds camera was still saving " +
+                "after $CAMERA_CLOSE_MAX_ATTEMPTS seconds",
         )
     }
 
-    private fun handleAiPicture(payload: ByteArray) {
-        if (payload.isEmpty()) return
-        val status = payload[0].toInt() and 0xFF
-        synchronized(aiPictureBuffer) {
-            when (status) {
+    private fun requireSuccess(
+        response: TuneBudsFrame,
+    ) {
+
+        val status =
+            TuneBudsProtocol.parseStatus(
+                response.payload,
+            )
+                ?: throw IOException(
+                    "TuneBuds command " +
+                        "0x${response.command.toString(16)} " +
+                        "returned no status",
+                )
+
+        if (status != 0) {
+
+            throw IOException(
+                "TuneBuds command " +
+                    "0x${response.command.toString(16)} " +
+                    "failed with status $status",
+            )
+        }
+    }
+
+    private fun handleFrame(
+        frame: TuneBudsFrame,
+    ) {
+
+        when (
+            frame.command
+        ) {
+
+            TuneBudsProtocol.CMD_WIFI_STATE -> {
+
+                if (
+                    frame.type ==
+                    TuneBudsFrameType.NOTIFICATION
+                ) {
+
+                    TuneBudsProtocol
+                        .parseStatus(
+                            frame.payload,
+                        )
+                        ?.let { value ->
+
+                            Log.i(
+                                TAG,
+                                "E1749: Wi-Fi state notification=$value",
+                            )
+
+                            _state.value =
+                                _state.value.copy(
+                                    wifiState =
+                                        value,
+                                )
+                        }
+                }
+            }
+
+            TuneBudsProtocol.CMD_DEVICE_INFO -> {
+
+                if (
+                    frame.type ==
+                    TuneBudsFrameType.RESPONSE
+                ) {
+
+                    runCatching {
+
+                        TuneBudsProtocol
+                            .parseDeviceInfo(
+                                frame.payload,
+                            )
+
+                    }.onSuccess(
+                        ::applyDeviceInfo,
+                    ).onFailure {
+
+                        Log.w(
+                            TAG,
+                            "Invalid device-info response",
+                            it,
+                        )
+                    }
+                }
+            }
+
+            TuneBudsProtocol.INFO_BATTERY -> {
+
+                TuneBudsProtocol
+                    .parseBattery(
+                        frame.payload,
+                    )
+                    ?.let(
+                        ::applyBattery,
+                    )
+            }
+
+            TuneBudsProtocol.CMD_AI_PICTURE -> {
+
+                if (
+                    frame.type ==
+                    TuneBudsFrameType.NOTIFICATION
+                ) {
+
+                    handleAiPicture(
+                        frame.payload,
+                    )
+                }
+            }
+
+            TuneBudsProtocol.CMD_COPROCESSOR_VERSION -> {
+
+                if (
+                    frame.type ==
+                    TuneBudsFrameType.NOTIFICATION
+                ) {
+
+                    TuneBudsProtocol
+                        .parseString(
+                            frame.payload,
+                        )
+                        ?.let { version ->
+
+                            _state.value =
+                                _state.value.copy(
+                                    coprocessorVersion =
+                                        version,
+                                    lastError =
+                                        null,
+                                )
+                        }
+                }
+            }
+
+            TuneBudsProtocol.CMD_CAMERA_COPROCESSOR_INFO -> {
+
+                if (
+                    frame.type ==
+                    TuneBudsFrameType.NOTIFICATION
+                ) {
+
+                    TuneBudsProtocol
+                        .parseStatus(
+                            frame.payload,
+                        )
+                        ?.let { type ->
+
+                            _state.value =
+                                _state.value.copy(
+                                    cameraCoprocessorType =
+                                        type,
+                                    lastError =
+                                        null,
+                                )
+                        }
+                }
+            }
+
+            TuneBudsProtocol.CMD_STORAGE -> {
+
+                if (
+                    frame.type ==
+                    TuneBudsFrameType.NOTIFICATION
+                ) {
+
+                    TuneBudsProtocol
+                        .parseStorage(
+                            frame.payload,
+                        )
+                        ?.let { storage ->
+
+                            _state.value =
+                                _state.value.copy(
+                                    storage =
+                                        storage,
+                                    lastError =
+                                        null,
+                                )
+                        }
+                }
+            }
+
+            TuneBudsProtocol.CMD_FILE_MANAGER -> {
+
+                if (
+                    frame.type ==
+                    TuneBudsFrameType.NOTIFICATION
+                ) {
+
+                    TuneBudsProtocol
+                        .parseString(
+                            frame.payload,
+                        )
+                        ?.let { endpoint ->
+
+                            Log.i(
+                                TAG,
+                                "E1749: endpoint notification=$endpoint",
+                            )
+
+                            _state.value =
+                                _state.value.copy(
+                                    mediaBaseUrl =
+                                        endpoint,
+                                    lastError =
+                                        null,
+                                )
+                        }
+                }
+            }
+
+            TuneBudsProtocol.CMD_MEDIA_COUNTS -> {
+
+                if (
+                    frame.type ==
+                    TuneBudsFrameType.NOTIFICATION
+                ) {
+
+                    TuneBudsProtocol
+                        .parseMediaCounts(
+                            frame.payload,
+                        )
+                        ?.let { counts ->
+
+                            _state.value =
+                                _state.value.copy(
+                                    mediaCounts =
+                                        counts,
+                                    lastError =
+                                        null,
+                                )
+                        }
+                }
+            }
+
+            TuneBudsProtocol.CMD_WORK_STATE -> {
+
+                TuneBudsProtocol
+                    .parseStatus(
+                        frame.payload,
+                    )
+                    ?.let { value ->
+
+                        _state.value =
+                            _state.value.copy(
+                                workState =
+                                    value,
+                                lastError =
+                                    null,
+                            )
+                    }
+            }
+        }
+    }
+
+    private fun applyDeviceInfo(
+        info: Map<Int, ByteArray>,
+    ) {
+
+        var current =
+            _state.value
+
+        info[
+            TuneBudsProtocol.INFO_BATTERY
+        ]?.let { payload ->
+
+            TuneBudsProtocol
+                .parseBattery(
+                    payload,
+                )
+                ?.let { battery ->
+
+                    current =
+                        current.copy(
+                            batteryPercent =
+                                battery.percent
+                                    .coerceIn(
+                                        0,
+                                        100,
+                                    ),
+                            isCharging =
+                                battery.isCharging,
+                        )
+                }
+        }
+
+        info[
+            TuneBudsProtocol.INFO_FIRMWARE_VERSION
+        ]?.let { payload ->
+
+            TuneBudsProtocol
+                .parseFirmwareVersion(
+                    payload,
+                )
+                ?.let {
+
+                    current =
+                        current.copy(
+                            firmwareVersion =
+                                it,
+                        )
+                }
+        }
+
+        info[
+            TuneBudsProtocol.INFO_MODEL
+        ]?.let { payload ->
+
+            TuneBudsProtocol
+                .parseString(
+                    payload,
+                )
+                ?.let {
+
+                    current =
+                        current.copy(
+                            model =
+                                it,
+                        )
+                }
+        }
+
+        info[
+            TuneBudsProtocol.INFO_SERIAL_NUMBER
+        ]?.let { payload ->
+
+            TuneBudsProtocol
+                .parseString(
+                    payload,
+                )
+                ?.let {
+
+                    current =
+                        current.copy(
+                            serialNumber =
+                                it,
+                        )
+                }
+        }
+
+        info[
+            TuneBudsProtocol.INFO_DEVICE_ABILITY
+        ]?.let { payload ->
+
+            current =
+                current.copy(
+                    deviceAbility =
+                        payload.copyOf(),
+                )
+
+            TuneBudsProtocol
+                .parseDeviceCapabilities(
+                    payload,
+                )
+                ?.let {
+
+                    current =
+                        current.copy(
+                            deviceCapabilityMask =
+                                it,
+                        )
+                }
+        }
+
+        info[
+            TuneBudsProtocol.INFO_SUPPORT_DETECTION
+        ]?.let { payload ->
+
+            TuneBudsProtocol
+                .parseUnsignedValue(
+                    payload,
+                )
+                ?.let {
+
+                    current =
+                        current.copy(
+                            supportDetection =
+                                it,
+                        )
+                }
+        }
+
+        info[
+            TuneBudsProtocol.INFO_SUPPORT_AUDIO
+        ]?.let { payload ->
+
+            TuneBudsProtocol
+                .parseUnsignedValue(
+                    payload,
+                )
+                ?.let {
+
+                    current =
+                        current.copy(
+                            supportAudio =
+                                it,
+                        )
+                }
+        }
+
+        info[
+            TuneBudsProtocol.INFO_VIDEO_LIMIT
+        ]?.let { payload ->
+
+            TuneBudsProtocol
+                .parseUnsignedValue(
+                    payload,
+                )
+                ?.let {
+
+                    current =
+                        current.copy(
+                            videoLimitSeconds =
+                                it,
+                        )
+                }
+        }
+
+        info[
+            TuneBudsProtocol.INFO_AUDIO_LIMIT
+        ]?.let { payload ->
+
+            TuneBudsProtocol
+                .parseUnsignedValue(
+                    payload,
+                )
+                ?.let {
+
+                    current =
+                        current.copy(
+                            audioLimitSeconds =
+                                it,
+                        )
+                }
+        }
+
+        info[
+            TuneBudsProtocol.INFO_SUPPORT_VOLUME_CONTROL
+        ]?.let { payload ->
+
+            TuneBudsProtocol
+                .parseUnsignedValue(
+                    payload,
+                )
+                ?.let {
+
+                    current =
+                        current.copy(
+                            supportVolumeControl =
+                                it,
+                        )
+                }
+        }
+
+        info[
+            TuneBudsProtocol.INFO_CURRENT_VOLUME
+        ]?.let { payload ->
+
+            current =
+                current.copy(
+                    currentVolume =
+                        payload.map {
+                            it.toInt() and
+                                0xFF
+                        },
+                )
+        }
+
+        info[
+            TuneBudsProtocol.INFO_SCREEN_CONFIG
+        ]?.let { payload ->
+
+            TuneBudsProtocol
+                .parseScreenConfig(
+                    payload,
+                )
+                ?.let {
+
+                    current =
+                        current.copy(
+                            screenConfig =
+                                it,
+                        )
+                }
+        }
+
+        info[
+            TuneBudsProtocol.INFO_RESOLUTION
+        ]?.let { payload ->
+
+            TuneBudsProtocol
+                .parseUnsignedValue(
+                    payload,
+                )
+                ?.let {
+
+                    current =
+                        current.copy(
+                            resolution =
+                                it,
+                        )
+                }
+        }
+
+        info[
+            TuneBudsProtocol.INFO_SUPPORT_OPUS
+        ]?.let { payload ->
+
+            TuneBudsProtocol
+                .parseUnsignedValue(
+                    payload,
+                )
+                ?.let {
+
+                    current =
+                        current.copy(
+                            supportOpus =
+                                it,
+                        )
+                }
+        }
+
+        info[
+            TuneBudsProtocol.INFO_AI_CHAT_SUPPORT
+        ]?.let { payload ->
+
+            TuneBudsProtocol
+                .parseUnsignedValue(
+                    payload,
+                )
+                ?.let {
+
+                    current =
+                        current.copy(
+                            supportAiChat =
+                                it,
+                        )
+                }
+        }
+
+        info[
+            TuneBudsProtocol.INFO_SUPPORT_APP_LIST
+        ]?.let { payload ->
+
+            TuneBudsProtocol
+                .parseUnsignedValue(
+                    payload,
+                )
+                ?.let {
+
+                    current =
+                        current.copy(
+                            supportAppList =
+                                it,
+                        )
+                }
+        }
+
+        info[
+            TuneBudsProtocol.INFO_WIFI_SUPPORT
+        ]
+            ?.firstOrNull()
+            ?.let { value ->
+
+                current =
+                    current.copy(
+                        wifiSupportMask =
+                            value.toInt() and
+                                0xFF,
+                    )
+            }
+
+        _state.value =
+            current.copy(
+                lastError =
+                    null,
+            )
+    }
+
+    private fun applyBattery(
+        battery: TuneBudsBattery,
+    ) {
+
+        _state.value =
+            _state.value.copy(
+                batteryPercent =
+                    battery.percent
+                        .coerceIn(
+                            0,
+                            100,
+                        ),
+                isCharging =
+                    battery.isCharging,
+                lastError =
+                    null,
+            )
+    }
+
+    private fun handleAiPicture(
+        payload: ByteArray,
+    ) {
+
+        if (
+            payload.isEmpty()
+        ) {
+            return
+        }
+
+        val status =
+            payload[0]
+                .toInt() and
+                0xFF
+
+        synchronized(
+            aiPictureBuffer,
+        ) {
+
+            when (
+                status
+            ) {
+
                 1 -> {
-                    if (payload.size > 1) aiPictureBuffer.write(payload, 1, payload.size - 1)
-                    Log.d(TAG, "TuneBuds AI photo chunk bytes=${payload.size - 1} total=${aiPictureBuffer.size()}")
+
+                    if (
+                        payload.size >
+                        1
+                    ) {
+
+                        aiPictureBuffer.write(
+                            payload,
+                            1,
+                            payload.size -
+                                1,
+                        )
+                    }
+
+                    Log.d(
+                        TAG,
+                        "TuneBuds AI photo chunk bytes=" +
+                            "${payload.size - 1} " +
+                            "total=${aiPictureBuffer.size()}",
+                    )
                 }
+
                 0 -> {
-                    if (payload.size > 1) aiPictureBuffer.write(payload, 1, payload.size - 1)
-                    val image = aiPictureBuffer.toByteArray()
+
+                    if (
+                        payload.size >
+                        1
+                    ) {
+
+                        aiPictureBuffer.write(
+                            payload,
+                            1,
+                            payload.size -
+                                1,
+                        )
+                    }
+
+                    val image =
+                        aiPictureBuffer
+                            .toByteArray()
+
                     aiPictureBuffer.reset()
-                    Log.i(TAG, "TuneBuds AI photo completed bytes=${image.size}")
-                    if (image.isNotEmpty()) _aiPhotos.tryEmit(image)
+
+                    Log.i(
+                        TAG,
+                        "TuneBuds AI photo completed bytes=${image.size}",
+                    )
+
+                    if (
+                        image.isNotEmpty()
+                    ) {
+
+                        _aiPhotos.tryEmit(
+                            image,
+                        )
+                    }
                 }
+
                 else -> {
+
                     aiPictureBuffer.reset()
-                    updateError("TuneBuds AI photo failed with status $status")
+
+                    updateError(
+                        "TuneBuds AI photo failed with status $status",
+                    )
                 }
             }
         }
     }
 
-    private fun launchCommand(operation: String, block: suspend () -> Unit) {
+    private fun launchCommand(
+        operation: String,
+        block: suspend () -> Unit,
+    ) {
+
         scope.launch {
-            if (!client.isConnected()) {
-                updateError("Connect TuneBuds glasses before trying to $operation")
+
+            if (
+                !client.isConnected()
+            ) {
+
+                updateError(
+                    "Connect TuneBuds glasses before trying to $operation",
+                )
+
                 return@launch
             }
-            runCatching { block() }
-                .onFailure { error -> updateError("Could not $operation: ${error.message}") }
+
+            runCatching {
+                block()
+            }.onFailure { error ->
+
+                updateError(
+                    "Could not $operation: ${error.message}",
+                )
+            }
         }
     }
 
-    private fun updateError(message: String) {
-        Log.w(TAG, message)
-        _state.value = _state.value.copy(lastError = message)
+    private fun updateError(
+        message: String,
+    ) {
+
+        Log.w(
+            TAG,
+            message,
+        )
+
+        _state.value =
+            _state.value.copy(
+                lastError =
+                    message,
+            )
     }
 }
