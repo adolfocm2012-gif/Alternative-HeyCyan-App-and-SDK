@@ -269,49 +269,111 @@ class TuneBudsManager private constructor(context: Context) {
         timeoutMs: Long = 30_000L,
     ): String? = coroutineScope {
         if (!client.isConnected()) return@coroutineScope null
-        _state.value = _state.value.copy(mediaBaseUrl = null, wifiState = null)
-        // Register before configuration so an immediate failure cannot be missed.
-        val wifiFailure = launch(start = CoroutineStart.UNDISPATCHED) {
-            val failed = state.first { it.wifiState in setOf(0, 4, 5) }
-            throw IOException("TuneBuds Wi-Fi connection failed (state ${failed.wifiState})")
-        }
-        val endpoint = async(start = CoroutineStart.UNDISPATCHED) {
-            state.filter { !it.mediaBaseUrl.isNullOrBlank() }.first().mediaBaseUrl
-        }
-        try {
-            requireSuccess(
-                request(
-                    TuneBudsProtocol.CMD_CONFIGURE_WIFI,
-                    TuneBudsProtocol.buildWifiPayload(
-                        mode = 0,
-                        ssid = hotspotSsid,
-                        password = hotspotPassword,
-                        channel = channel,
-                    ),
-                ),
+
+        val modes = intArrayOf(2, 1, 0)
+        var lastError: Throwable? = null
+
+        for (mode in modes) {
+            _state.value = _state.value.copy(
+                mediaBaseUrl = null,
+                wifiState = null,
+                lastError = null,
             )
-            var fileManagerAttempt = 1
-            while (true) {
-                val response = request(TuneBudsProtocol.CMD_FILE_MANAGER)
-                when (val status = TuneBudsProtocol.parseStatus(response.payload)) {
-                    0 -> break
-                    1, 3, 5 -> {
-                        if (fileManagerAttempt >= FILE_MANAGER_MAX_ATTEMPTS) {
-                            throw IOException("TuneBuds file manager remained busy for ${FILE_MANAGER_MAX_ATTEMPTS}s")
+
+            Log.i(TAG, "Trying TuneBuds Wi-Fi media mode=$mode")
+
+            try {
+                requireSuccess(
+                    request(
+                        TuneBudsProtocol.CMD_CONFIGURE_WIFI,
+                        TuneBudsProtocol.buildWifiPayload(
+                            mode = mode,
+                            ssid = hotspotSsid,
+                            password = hotspotPassword,
+                            channel = channel,
+                        ),
+                    ),
+                )
+
+                var fileManagerAttempt = 1
+
+                while (true) {
+                    val response = request(TuneBudsProtocol.CMD_FILE_MANAGER)
+
+                    when (val status = TuneBudsProtocol.parseStatus(response.payload)) {
+                        0 -> break
+
+                        1, 3, 5 -> {
+                            if (fileManagerAttempt >= FILE_MANAGER_MAX_ATTEMPTS) {
+                                throw IOException(
+                                    "TuneBuds file manager remained busy for ${FILE_MANAGER_MAX_ATTEMPTS}s in Wi-Fi mode $mode",
+                                )
+                            }
+
+                            Log.i(
+                                TAG,
+                                "TuneBuds file manager busy status=$status mode=$mode attempt=$fileManagerAttempt",
+                            )
+
+                            fileManagerAttempt++
+                            delay(FILE_MANAGER_RETRY_MS)
                         }
-                        Log.i(TAG, "TuneBuds file manager busy status=$status attempt=$fileManagerAttempt")
-                        fileManagerAttempt++
-                        delay(FILE_MANAGER_RETRY_MS)
+
+                        null -> {
+                            throw IOException(
+                                "TuneBuds file manager returned no status in Wi-Fi mode $mode",
+                            )
+                        }
+
+                        else -> {
+                            throw IOException(
+                                "TuneBuds file manager failed with status $status in Wi-Fi mode $mode",
+                            )
+                        }
                     }
-                    null -> throw IOException("TuneBuds file manager returned no status")
-                    else -> throw IOException("TuneBuds file manager failed with status $status")
                 }
+
+                val result = withTimeoutOrNull(timeoutMs) {
+                    state.first { snapshot ->
+                        !snapshot.mediaBaseUrl.isNullOrBlank() ||
+                            snapshot.wifiState in setOf(0, 4, 5)
+                    }
+                } ?: throw IOException(
+                    "TuneBuds Wi-Fi mode $mode timed out waiting for media server",
+                )
+
+                val endpoint = result.mediaBaseUrl
+
+                if (!endpoint.isNullOrBlank()) {
+                    Log.i(
+                        TAG,
+                        "TuneBuds media server available in Wi-Fi mode $mode: $endpoint",
+                    )
+                    return@coroutineScope endpoint
+                }
+
+                throw IOException(
+                    "TuneBuds Wi-Fi mode $mode failed (state ${result.wifiState})",
+                )
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                lastError = error
+
+                Log.w(
+                    TAG,
+                    "TuneBuds Wi-Fi media mode $mode failed, trying next mode",
+                    error,
+                )
+
+                delay(1_000L)
             }
-            withTimeoutOrNull(timeoutMs) { endpoint.await() }
-        } finally {
-            wifiFailure.cancel()
-            endpoint.cancel()
         }
+
+        throw (
+            lastError
+                ?: IOException("TuneBuds could not start its media server in any Wi-Fi mode")
+        )
     }
 
     fun finishTransfer() = launchCommand("close camera subsystem") {
