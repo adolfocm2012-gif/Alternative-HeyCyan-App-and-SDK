@@ -155,8 +155,8 @@ class TuneBudsManager private constructor(context: Context) {
             sameAddress &&
             (
                 client.isConnected() ||
-                connectJob?.isActive == true
-            )
+                    connectJob?.isActive == true
+                )
         ) {
             return
         }
@@ -207,10 +207,13 @@ class TuneBudsManager private constructor(context: Context) {
 
     fun takePhoto() =
         launchCommand("take photo") {
+            takePhotoBlocking()
+
+            delay(500L)
+
             requireSuccess(
                 request(
-                    TuneBudsProtocol.CMD_CAMERA_ON,
-                    byteArrayOf(0),
+                    TuneBudsProtocol.CMD_MEDIA_COUNTS,
                 ),
             )
         }
