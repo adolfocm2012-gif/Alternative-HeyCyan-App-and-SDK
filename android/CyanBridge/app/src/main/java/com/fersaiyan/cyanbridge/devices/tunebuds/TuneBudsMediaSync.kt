@@ -10,6 +10,7 @@ import android.os.Looper
 import com.fersaiyan.cyanbridge.ui.hasWifiP2pPermission
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -19,6 +20,7 @@ import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
@@ -207,6 +209,15 @@ class TuneBudsMediaSync(
         private const val RAW_PREVIEW_UI_LIMIT = 240
         private const val RAW_PREVIEW_LOG_LIMIT = 4_000
 
+        /*
+         * Some E1749 firmware builds close long HTTP media streams
+         * before the advertised Content-Length has been delivered.
+         *
+         * Keep the partial file and resume with HTTP Range.
+         */
+        private const val MEDIA_DOWNLOAD_MAX_ATTEMPTS = 6
+        private const val MEDIA_DOWNLOAD_RETRY_MS = 750L
+
         private val CLIENT =
             OkHttpClient.Builder()
                 .connectTimeout(20, TimeUnit.SECONDS)
@@ -245,11 +256,6 @@ class TuneBudsMediaSync(
              * E1749 firmware 0.1.0.7:
              *
              * Do NOT send CAMERA_CLOSE (0xE2) here.
-             *
-             * On this hardware the media is already finalized after
-             * stopping video/audio. Sending an additional close command
-             * immediately before file-manager mode may disturb the
-             * firmware's media index.
              */
             state =
                 state.copy(
@@ -260,10 +266,6 @@ class TuneBudsMediaSync(
             android.util.Log.i(TAG, state.detail)
             onState(state)
 
-            /*
-             * D2
-             * Ask Android to create a local-only hotspot.
-             */
             state =
                 state.copy(
                     detail = "D2/7: Creando hotspot del teléfono",
@@ -276,11 +278,6 @@ class TuneBudsMediaSync(
             val credentials =
                 hotspot.start()
 
-            /*
-             * D3
-             * Android successfully created the hotspot.
-             * Never display/log the password.
-             */
             state =
                 state.copy(
                     detail =
@@ -297,10 +294,6 @@ class TuneBudsMediaSync(
 
             onState(state)
 
-            /*
-             * D4
-             * Send hotspot credentials and request file-manager mode.
-             */
             state =
                 state.copy(
                     detail = "D4/7: Conectando gafas al hotspot",
@@ -320,10 +313,6 @@ class TuneBudsMediaSync(
                         "TuneBuds did not report its media server address",
                     )
 
-            /*
-             * D5
-             * Glasses announced their HTTP media-server endpoint.
-             */
             state =
                 state.copy(
                     detail = "D5/7: Servidor recibido: $endpoint",
@@ -336,11 +325,6 @@ class TuneBudsMediaSync(
             val baseUrl =
                 normalizeBaseUrl(endpoint)
 
-            /*
-             * D6
-             * Read media.config exactly once and preserve its raw body
-             * for E1749 diagnostics before parsing it.
-             */
             state =
                 state.copy(
                     detail =
@@ -375,10 +359,6 @@ class TuneBudsMediaSync(
             val items =
                 parseManifest(manifestBody)
 
-            /*
-             * D7
-             * Manifest was retrieved and parsed.
-             */
             state =
                 state.copy(
                     total = items.size,
@@ -505,10 +485,7 @@ class TuneBudsMediaSync(
             return Result.failure(error)
         } finally {
             /*
-             * E1749 firmware 0.1.0.7:
-             *
-             * Do NOT send CAMERA_CLOSE (0xE2) after the transfer either.
-             * Only tear down the phone hotspot and temporary local files.
+             * Do not send CAMERA_CLOSE here on firmware 0.1.0.7.
              */
             withContext(
                 kotlinx.coroutines.NonCancellable,
@@ -607,101 +584,287 @@ class TuneBudsMediaSync(
                     delete()
                 }
 
-            val request =
-                Request.Builder()
-                    .url(
-                        baseUrl +
-                            encodePath(item.remoteName),
-                    )
-                    .header(
-                        "Connection",
-                        "close",
-                    )
-                    .header(
-                        "User-Agent",
-                        "TSClient/1.0",
-                    )
-                    .get()
-                    .build()
+            val mediaUrl =
+                baseUrl +
+                    encodePath(item.remoteName)
 
-            android.util.Log.i(
-                TAG,
-                "HTTP GET media file: ${item.remoteName}",
-            )
+            var expectedTotal =
+                -1L
 
-            CLIENT
-                .newCall(request)
-                .execute()
-                .use { response ->
-                    if (!response.isSuccessful) {
-                        throw IOException(
-                            "TuneBuds HTTP ${response.code} for ${item.fileName}",
+            var attempt =
+                0
+
+            var lastFailure: IOException? =
+                null
+
+            while (attempt < MEDIA_DOWNLOAD_MAX_ATTEMPTS) {
+                coroutineContext.ensureActive()
+
+                val requestedOffset =
+                    output.length()
+
+                val requestBuilder =
+                    Request.Builder()
+                        .url(mediaUrl)
+                        .header(
+                            "Connection",
+                            "close",
                         )
-                    }
+                        .header(
+                            "User-Agent",
+                            "TSClient/1.0",
+                        )
+                        .header(
+                            "Accept-Encoding",
+                            "identity",
+                        )
 
-                    val body =
-                        response.body
-                            ?: throw IOException(
-                                "TuneBuds returned no data for ${item.fileName}",
-                            )
-
-                    val total =
-                        body.contentLength()
-
-                    android.util.Log.i(
-                        TAG,
-                        "Media HTTP response=${response.code}, " +
-                            "length=$total, file=${item.fileName}",
+                if (requestedOffset > 0L) {
+                    requestBuilder.header(
+                        "Range",
+                        "bytes=$requestedOffset-",
                     )
 
-                    var copied =
-                        0L
-
-                    body
-                        .byteStream()
-                        .use { input ->
-                            output
-                                .outputStream()
-                                .buffered(128 * 1024)
-                                .use { target ->
-                                    val buffer =
-                                        ByteArray(128 * 1024)
-
-                                    while (true) {
-                                        coroutineContext.ensureActive()
-
-                                        val count =
-                                            input.read(buffer)
-
-                                        if (count <= 0) {
-                                            break
-                                        }
-
-                                        target.write(
-                                            buffer,
-                                            0,
-                                            count,
-                                        )
-
-                                        copied += count
-
-                                        onProgress(
-                                            item,
-                                            copied,
-                                            total,
-                                        )
-                                    }
-                                }
-                        }
-
                     android.util.Log.i(
                         TAG,
-                        "Media download completed: " +
-                            "$copied bytes for ${item.fileName}",
+                        "Resuming ${item.fileName} " +
+                            "from byte $requestedOffset " +
+                            "(attempt ${attempt + 1})",
+                    )
+                } else {
+                    android.util.Log.i(
+                        TAG,
+                        "HTTP GET media file: ${item.remoteName} " +
+                            "(attempt ${attempt + 1})",
                     )
                 }
 
-            output
+                val request =
+                    requestBuilder
+                        .get()
+                        .build()
+
+                try {
+                    CLIENT
+                        .newCall(request)
+                        .execute()
+                        .use { response ->
+                            if (!response.isSuccessful) {
+                                throw IOException(
+                                    "TuneBuds HTTP ${response.code} " +
+                                        "for ${item.fileName}",
+                                )
+                            }
+
+                            var writeOffset =
+                                requestedOffset
+
+                            /*
+                             * A resumed request should normally return 206.
+                             *
+                             * If the server ignores Range and returns 200,
+                             * restart the local file instead of appending a
+                             * second complete copy.
+                             */
+                            if (
+                                requestedOffset > 0L &&
+                                response.code == 200
+                            ) {
+                                android.util.Log.w(
+                                    TAG,
+                                    "TuneBuds ignored Range for " +
+                                        "${item.fileName}; restarting file",
+                                )
+
+                                output.delete()
+                                output.createNewFile()
+
+                                writeOffset = 0L
+                            }
+
+                            val contentRange =
+                                response.header(
+                                    "Content-Range",
+                                )
+
+                            val rangeStart =
+                                contentRangeStart(
+                                    contentRange,
+                                )
+
+                            val rangeTotal =
+                                contentRangeTotal(
+                                    contentRange,
+                                )
+
+                            if (
+                                response.code == 206 &&
+                                requestedOffset > 0L &&
+                                rangeStart != null &&
+                                rangeStart != requestedOffset
+                            ) {
+                                throw IOException(
+                                    "TuneBuds resumed at byte " +
+                                        "$rangeStart instead of " +
+                                        "$requestedOffset",
+                                )
+                            }
+
+                            val body =
+                                response.body
+                                    ?: throw IOException(
+                                        "TuneBuds returned no data " +
+                                            "for ${item.fileName}",
+                                    )
+
+                            val responseLength =
+                                body.contentLength()
+
+                            if (rangeTotal != null) {
+                                expectedTotal =
+                                    rangeTotal
+                            } else if (
+                                response.code == 200 &&
+                                responseLength >= 0L
+                            ) {
+                                expectedTotal =
+                                    responseLength
+                            }
+
+                            android.util.Log.i(
+                                TAG,
+                                "Media HTTP response=${response.code}, " +
+                                    "responseLength=$responseLength, " +
+                                    "expectedTotal=$expectedTotal, " +
+                                    "offset=$writeOffset, " +
+                                    "file=${item.fileName}",
+                            )
+
+                            var copied =
+                                writeOffset
+
+                            body
+                                .byteStream()
+                                .use { input ->
+                                    FileOutputStream(
+                                        output,
+                                        writeOffset > 0L,
+                                    )
+                                        .buffered(
+                                            128 * 1024,
+                                        )
+                                        .use { target ->
+                                            val buffer =
+                                                ByteArray(
+                                                    128 * 1024,
+                                                )
+
+                                            while (true) {
+                                                coroutineContext.ensureActive()
+
+                                                val count =
+                                                    input.read(
+                                                        buffer,
+                                                    )
+
+                                                if (count <= 0) {
+                                                    break
+                                                }
+
+                                                target.write(
+                                                    buffer,
+                                                    0,
+                                                    count,
+                                                )
+
+                                                copied +=
+                                                    count
+
+                                                onProgress(
+                                                    item,
+                                                    copied,
+                                                    expectedTotal,
+                                                )
+                                            }
+                                        }
+                                }
+
+                            /*
+                             * A clean EOF is only success when the number
+                             * of bytes agrees with the announced total.
+                             */
+                            if (
+                                expectedTotal > 0L &&
+                                copied < expectedTotal
+                            ) {
+                                throw IOException(
+                                    "TuneBuds stream ended early at " +
+                                        "$copied/$expectedTotal bytes",
+                                )
+                            }
+
+                            android.util.Log.i(
+                                TAG,
+                                "Media download completed: " +
+                                    "$copied bytes for ${item.fileName}",
+                            )
+                        }
+
+                    return@withContext output
+                } catch (error: IOException) {
+                    lastFailure =
+                        error
+
+                    attempt++
+
+                    val currentSize =
+                        output.length()
+
+                    android.util.Log.w(
+                        TAG,
+                        "Media download interrupted: " +
+                            "${item.fileName}, " +
+                            "received=$currentSize, " +
+                            "expected=$expectedTotal, " +
+                            "attempt=$attempt/" +
+                            "$MEDIA_DOWNLOAD_MAX_ATTEMPTS, " +
+                            "error=${error.message}",
+                        error,
+                    )
+
+                    if (
+                        expectedTotal > 0L &&
+                        currentSize >= expectedTotal
+                    ) {
+                        android.util.Log.i(
+                            TAG,
+                            "Partial download already reached " +
+                                "expected size; accepting file",
+                        )
+
+                        return@withContext output
+                    }
+
+                    if (
+                        attempt >=
+                        MEDIA_DOWNLOAD_MAX_ATTEMPTS
+                    ) {
+                        break
+                    }
+
+                    delay(
+                        MEDIA_DOWNLOAD_RETRY_MS,
+                    )
+                }
+            }
+
+            throw IOException(
+                "TuneBuds media download failed after " +
+                    "$MEDIA_DOWNLOAD_MAX_ATTEMPTS attempts " +
+                    "at ${output.length()}/" +
+                    "${if (expectedTotal > 0L) expectedTotal else "?"} bytes",
+                lastFailure,
+            )
         }
 
     private fun getText(
@@ -748,6 +911,56 @@ class TuneBudsMediaSync(
                         "TuneBuds returned an empty media.config",
                     )
             }
+    }
+
+    private fun contentRangeStart(
+        value: String?,
+    ): Long? {
+        if (value.isNullOrBlank()) {
+            return null
+        }
+
+        val range =
+            value
+                .substringAfter(
+                    "bytes ",
+                    "",
+                )
+                .substringBefore('/')
+
+        if (range.isBlank()) {
+            return null
+        }
+
+        return range
+            .substringBefore('-')
+            .trim()
+            .toLongOrNull()
+    }
+
+    private fun contentRangeTotal(
+        value: String?,
+    ): Long? {
+        if (value.isNullOrBlank()) {
+            return null
+        }
+
+        val total =
+            value
+                .substringAfter(
+                    '/',
+                    "",
+                )
+                .trim()
+
+        if (
+            total.isBlank() ||
+            total == "*"
+        ) {
+            return null
+        }
+
+        return total.toLongOrNull()
     }
 
     private fun manifestPreview(
