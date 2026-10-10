@@ -58,11 +58,17 @@ data class TuneBudsState(
     val storage: TuneBudsStorageInfo? = null,
     val mediaCounts: TuneBudsMediaCounts? = null,
     val mediaBaseUrl: String? = null,
+    val p2pPeerAddress: String? = null,
     val wifiState: Int? = null,
     val workState: Int? = null,
     val isVideoRecording: Boolean = false,
     val isAudioRecording: Boolean = false,
     val lastError: String? = null,
+)
+
+data class TuneBudsP2pFileManagerInfo(
+    val endpoint: String,
+    val peerAddress: String,
 )
 
 /** Owns the TuneBuds SPP session and exposes only understood AB Mate operations. */
@@ -74,6 +80,7 @@ class TuneBudsManager private constructor(context: Context) {
         private const val CAMERA_CLOSE_MAX_ATTEMPTS = 15
         private const val FILE_MANAGER_RETRY_MS = 1_000L
         private const val FILE_MANAGER_MAX_ATTEMPTS = 30
+        private const val CMD_P2P_PEER_ADDRESS = 0xF2
         private const val CMD_PHOTO_COMPLETE = 0xF3
         private const val PHOTO_COMPLETE_TIMEOUT_MS = 15_000L
 
@@ -464,14 +471,6 @@ class TuneBudsManager private constructor(context: Context) {
                 lastError = null,
             )
 
-        /*
-         * E1749 diagnostic:
-         *
-         * The official AB Mate / TuneBuds path uses Wi-Fi mode 0.
-         * We watch Wi-Fi failure notifications at the same time
-         * that we wait for the HTTP media-server endpoint.
-         */
-
         val wifiFailure =
             launch(start = CoroutineStart.UNDISPATCHED) {
 
@@ -627,6 +626,147 @@ class TuneBudsManager private constructor(context: Context) {
 
             wifiFailure.cancel()
             endpoint.cancel()
+        }
+    }
+
+    suspend fun startFileManagerP2p(
+        p2pSsid: String,
+        timeoutMs: Long = 45_000L,
+    ): TuneBudsP2pFileManagerInfo? = coroutineScope {
+
+        if (!client.isConnected()) {
+            return@coroutineScope null
+        }
+
+        _state.value =
+            _state.value.copy(
+                mediaBaseUrl = null,
+                p2pPeerAddress = null,
+                wifiState = null,
+                lastError = null,
+            )
+
+        val wifiFailure =
+            launch(start = CoroutineStart.UNDISPATCHED) {
+                val failed =
+                    state.first {
+                        it.wifiState in setOf(
+                            0,
+                            4,
+                            5,
+                        )
+                    }
+
+                throw IOException(
+                    "TuneBuds P2P failed " +
+                        "(Wi-Fi state ${failed.wifiState})",
+                )
+            }
+
+        val ready =
+            async(start = CoroutineStart.UNDISPATCHED) {
+                state
+                    .filter {
+                        it.wifiState == 2 &&
+                            !it.p2pPeerAddress.isNullOrBlank() &&
+                            !it.mediaBaseUrl.isNullOrBlank()
+                    }
+                    .first()
+            }
+
+        try {
+            Log.i(
+                TAG,
+                "E1749: configuring Wi-Fi Direct P2P, ssid=$p2pSsid",
+            )
+
+            requireSuccess(
+                request(
+                    TuneBudsProtocol.CMD_CONFIGURE_WIFI,
+                    TuneBudsProtocol.buildWifiPayload(
+                        mode = 2,
+                        ssid = p2pSsid,
+                        password = "",
+                        channel = 0,
+                    ),
+                ),
+            )
+
+            var fileManagerAttempt = 1
+
+            while (true) {
+                val response =
+                    request(
+                        TuneBudsProtocol.CMD_FILE_MANAGER,
+                    )
+
+                when (
+                    val status =
+                        TuneBudsProtocol.parseStatus(
+                            response.payload,
+                        )
+                ) {
+                    0 -> break
+
+                    1,
+                    3,
+                    5,
+                    -> {
+                        if (
+                            fileManagerAttempt >=
+                            FILE_MANAGER_MAX_ATTEMPTS
+                        ) {
+                            throw IOException(
+                                "TuneBuds P2P file manager remained busy " +
+                                    "after $FILE_MANAGER_MAX_ATTEMPTS attempts",
+                            )
+                        }
+
+                        fileManagerAttempt++
+                        delay(
+                            FILE_MANAGER_RETRY_MS,
+                        )
+                    }
+
+                    null -> {
+                        throw IOException(
+                            "TuneBuds P2P file manager returned no status",
+                        )
+                    }
+
+                    else -> {
+                        throw IOException(
+                            "TuneBuds P2P file manager failed " +
+                                "with status $status",
+                        )
+                    }
+                }
+            }
+
+            val snapshot =
+                withTimeoutOrNull(timeoutMs) {
+                    ready.await()
+                }
+                    ?: throw IOException(
+                        "TuneBuds did not report P2P state, peer MAC " +
+                            "and media endpoint within ${timeoutMs / 1000}s",
+                    )
+
+            TuneBudsP2pFileManagerInfo(
+                endpoint =
+                    snapshot.mediaBaseUrl
+                        ?: throw IOException(
+                            "TuneBuds P2P endpoint was empty",
+                        ),
+                peerAddress =
+                    snapshot.p2pPeerAddress
+                        ?: throw IOException(
+                            "TuneBuds P2P peer address was empty",
+                        ),
+            )
+        } finally {
+            wifiFailure.cancel()
+            ready.cancel()
         }
     }
 
@@ -884,12 +1024,6 @@ class TuneBudsManager private constructor(context: Context) {
                 }
 
                 1 -> {
-
-                    /*
-                     * Recording has stopped,
-                     * but the camera is still
-                     * finishing the file.
-                     */
 
                     if (
                         attempt <
@@ -1155,6 +1289,39 @@ class TuneBudsManager private constructor(context: Context) {
                         TAG,
                         "E1749: received photo completion notification (0xF3), bytes=${frame.payload.size}",
                     )
+                }
+            }
+
+            CMD_P2P_PEER_ADDRESS -> {
+
+                if (
+                    frame.type ==
+                    TuneBudsFrameType.NOTIFICATION &&
+                    frame.payload.size >= 6
+                ) {
+                    val peerAddress =
+                        frame.payload
+                            .take(6)
+                            .joinToString(
+                                separator = ":",
+                            ) { value ->
+                                "%02X".format(
+                                    value.toInt() and 0xFF,
+                                )
+                            }
+
+                    Log.i(
+                        TAG,
+                        "E1749: P2P peer notification=$peerAddress",
+                    )
+
+                    _state.value =
+                        _state.value.copy(
+                            p2pPeerAddress =
+                                peerAddress,
+                            lastError =
+                                null,
+                        )
                 }
             }
 
