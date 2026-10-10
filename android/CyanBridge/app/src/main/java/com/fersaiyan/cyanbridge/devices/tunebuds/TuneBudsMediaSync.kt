@@ -19,9 +19,14 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.File
-import java.io.FileOutputStream
 import java.io.IOException
+import java.io.RandomAccessFile
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.net.URL
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
@@ -35,18 +40,19 @@ data class TuneBudsHotspotCredentials(
     val channel: Int = 0,
 )
 
-/** Owns the phone-created local hotspot used by the safest AB Mate media path. */
 class TuneBudsLocalHotspot(context: Context) {
     companion object {
         private const val START_TIMEOUT_MS = 30_000L
     }
 
     private val context = context.applicationContext
+
     private val wifiManager =
         context.getSystemService(Context.WIFI_SERVICE) as WifiManager
 
     @Volatile
-    private var reservation: WifiManager.LocalOnlyHotspotReservation? = null
+    private var reservation:
+        WifiManager.LocalOnlyHotspotReservation? = null
 
     @SuppressLint("MissingPermission")
     suspend fun start(): TuneBudsHotspotCredentials {
@@ -60,12 +66,15 @@ class TuneBudsLocalHotspot(context: Context) {
 
         return withTimeout(START_TIMEOUT_MS) {
             suspendCancellableCoroutine { continuation ->
+
                 continuation.invokeOnCancellation {
                     stop()
                 }
 
                 wifiManager.startLocalOnlyHotspot(
-                    object : WifiManager.LocalOnlyHotspotCallback() {
+                    object :
+                        WifiManager.LocalOnlyHotspotCallback() {
+
                         override fun onStarted(
                             startedReservation:
                                 WifiManager.LocalOnlyHotspotReservation,
@@ -75,20 +84,27 @@ class TuneBudsLocalHotspot(context: Context) {
                                 return
                             }
 
-                            reservation = startedReservation
+                            reservation =
+                                startedReservation
 
                             val credentials =
-                                readCredentials(startedReservation)
+                                readCredentials(
+                                    startedReservation,
+                                )
 
                             if (credentials == null) {
                                 stop()
-                                continuation.resumeWithException(
-                                    IOException(
-                                        "Android returned empty hotspot credentials",
-                                    ),
-                                )
+
+                                continuation
+                                    .resumeWithException(
+                                        IOException(
+                                            "Android returned empty hotspot credentials",
+                                        ),
+                                    )
                             } else {
-                                continuation.resume(credentials)
+                                continuation.resume(
+                                    credentials,
+                                )
                             }
                         }
 
@@ -96,35 +112,44 @@ class TuneBudsLocalHotspot(context: Context) {
                             reservation = null
 
                             if (continuation.isActive) {
-                                continuation.resumeWithException(
-                                    IOException(
-                                        "Local hotspot stopped before it was ready",
-                                    ),
-                                )
+                                continuation
+                                    .resumeWithException(
+                                        IOException(
+                                            "Local hotspot stopped before it was ready",
+                                        ),
+                                    )
                             }
                         }
 
-                        override fun onFailed(reason: Int) {
+                        override fun onFailed(
+                            reason: Int,
+                        ) {
                             reservation = null
 
                             if (continuation.isActive) {
-                                continuation.resumeWithException(
-                                    IOException(
-                                        "Could not start local hotspot: $reason",
-                                    ),
-                                )
+                                continuation
+                                    .resumeWithException(
+                                        IOException(
+                                            "Could not start local hotspot: $reason",
+                                        ),
+                                    )
                             }
                         }
                     },
-                    Handler(Looper.getMainLooper()),
+                    Handler(
+                        Looper.getMainLooper(),
+                    ),
                 )
             }
         }
     }
 
     fun stop() {
-        val current = reservation
-        reservation = null
+        val current =
+            reservation
+
+        reservation =
+            null
 
         runCatching {
             current?.close()
@@ -133,8 +158,10 @@ class TuneBudsLocalHotspot(context: Context) {
 
     @Suppress("DEPRECATION")
     private fun readCredentials(
-        current: WifiManager.LocalOnlyHotspotReservation,
+        current:
+            WifiManager.LocalOnlyHotspotReservation,
     ): TuneBudsHotspotCredentials? {
+
         val ssid: String?
         val password: String?
         val channel: Int
@@ -143,19 +170,30 @@ class TuneBudsLocalHotspot(context: Context) {
             Build.VERSION.SDK_INT >=
             Build.VERSION_CODES.TIRAMISU
         ) {
-            val configuration: SoftApConfiguration =
+            val configuration:
+                SoftApConfiguration =
                 current.softApConfiguration
 
-            ssid = configuration.ssid
-            password = configuration.passphrase
-            channel = 0
+            ssid =
+                configuration.ssid
+
+            password =
+                configuration.passphrase
+
+            channel =
+                0
         } else {
             val configuration =
                 current.wifiConfiguration
 
-            ssid = configuration?.SSID
-            password = configuration?.preSharedKey
-            channel = 0
+            ssid =
+                configuration?.SSID
+
+            password =
+                configuration?.preSharedKey
+
+            channel =
+                0
         }
 
         if (
@@ -168,12 +206,18 @@ class TuneBudsLocalHotspot(context: Context) {
         return TuneBudsHotspotCredentials(
             ssid = ssid,
             password = password,
-            channel = channel.coerceIn(0, 0xFF),
+            channel =
+                channel.coerceIn(
+                    0,
+                    0xFF,
+                ),
         )
     }
 
     private fun hasWifiPermission(): Boolean =
-        hasWifiP2pPermission(context)
+        hasWifiP2pPermission(
+            context,
+        )
 }
 
 enum class TuneBudsMediaType {
@@ -195,40 +239,62 @@ data class TuneBudsMediaSyncState(
     val lastError: String? = null,
 )
 
-/**
- * Non-destructive TuneBuds HTTP media importer.
- * Device files are never deleted.
- */
+private data class RawHttpDownloadResult(
+    val copied: Long,
+    val advertisedLength: Long,
+    val readError: IOException?,
+)
+
 class TuneBudsMediaSync(
     private val manager: TuneBudsManager,
     private val hotspot: TuneBudsLocalHotspot,
     private val temporaryDirectory: File,
 ) {
     companion object {
-        private const val TAG = "TuneBudsMediaSync"
-        private const val RAW_PREVIEW_UI_LIMIT = 240
-        private const val RAW_PREVIEW_LOG_LIMIT = 4_000
+        private const val TAG =
+            "TuneBudsMediaSync"
 
-        /*
-         * Some E1749 firmware builds close long HTTP media streams
-         * before the advertised Content-Length has been delivered.
-         *
-         * Keep the partial file and resume with HTTP Range.
-         */
-        private const val MEDIA_DOWNLOAD_MAX_ATTEMPTS = 6
-        private const val MEDIA_DOWNLOAD_RETRY_MS = 750L
+        private const val RAW_PREVIEW_UI_LIMIT =
+            240
+
+        private const val RAW_PREVIEW_LOG_LIMIT =
+            4_000
+
+        private const val MEDIA_DOWNLOAD_MAX_ATTEMPTS =
+            5
+
+        private const val MEDIA_DOWNLOAD_RETRY_MS =
+            750L
+
+        private const val RAW_HTTP_CONNECT_TIMEOUT_MS =
+            20_000
+
+        private const val RAW_HTTP_READ_TIMEOUT_MS =
+            120_000
 
         private val CLIENT =
-            OkHttpClient.Builder()
-                .connectTimeout(20, TimeUnit.SECONDS)
-                .readTimeout(120, TimeUnit.SECONDS)
-                .writeTimeout(30, TimeUnit.SECONDS)
+            OkHttpClient
+                .Builder()
+                .connectTimeout(
+                    20,
+                    TimeUnit.SECONDS,
+                )
+                .readTimeout(
+                    120,
+                    TimeUnit.SECONDS,
+                )
+                .writeTimeout(
+                    30,
+                    TimeUnit.SECONDS,
+                )
                 .build()
     }
 
     suspend fun sync(
         onState:
-            suspend (TuneBudsMediaSyncState) -> Unit = {},
+            suspend (
+                TuneBudsMediaSyncState,
+            ) -> Unit = {},
         onProgress:
             suspend (
                 TuneBudsMediaItem,
@@ -241,39 +307,58 @@ class TuneBudsMediaSync(
                 File,
             ) -> Boolean,
     ): Result<Int> {
+
         var state =
             TuneBudsMediaSyncState(
-                detail = "D1/7: Preparando sincronización",
+                detail =
+                    "D1/7: Preparando sincronización",
             )
 
-        android.util.Log.i(TAG, state.detail)
-        onState(state)
+        android.util.Log.i(
+            TAG,
+            state.detail,
+        )
+
+        onState(
+            state,
+        )
 
         temporaryDirectory.mkdirs()
 
         try {
-            /*
-             * E1749 firmware 0.1.0.7:
-             *
-             * Do NOT send CAMERA_CLOSE (0xE2) here.
-             */
             state =
                 state.copy(
-                    detail = "D1/7: Sin cierre extra de cámara",
-                    lastError = null,
+                    detail =
+                        "D1/7: Sin cierre extra de cámara",
+                    lastError =
+                        null,
                 )
 
-            android.util.Log.i(TAG, state.detail)
-            onState(state)
+            android.util.Log.i(
+                TAG,
+                state.detail,
+            )
+
+            onState(
+                state,
+            )
 
             state =
                 state.copy(
-                    detail = "D2/7: Creando hotspot del teléfono",
-                    lastError = null,
+                    detail =
+                        "D2/7: Creando hotspot del teléfono",
+                    lastError =
+                        null,
                 )
 
-            android.util.Log.i(TAG, state.detail)
-            onState(state)
+            android.util.Log.i(
+                TAG,
+                state.detail,
+            )
+
+            onState(
+                state,
+            )
 
             val credentials =
                 hotspot.start()
@@ -282,7 +367,8 @@ class TuneBudsMediaSync(
                 state.copy(
                     detail =
                         "D3/7: Hotspot creado (${credentials.ssid})",
-                    lastError = null,
+                    lastError =
+                        null,
                 )
 
             android.util.Log.i(
@@ -292,53 +378,88 @@ class TuneBudsMediaSync(
                     "channel=${credentials.channel}",
             )
 
-            onState(state)
+            onState(
+                state,
+            )
 
             state =
                 state.copy(
-                    detail = "D4/7: Conectando gafas al hotspot",
-                    lastError = null,
+                    detail =
+                        "D4/7: Conectando gafas al hotspot",
+                    lastError =
+                        null,
                 )
 
-            android.util.Log.i(TAG, state.detail)
-            onState(state)
+            android.util.Log.i(
+                TAG,
+                state.detail,
+            )
+
+            onState(
+                state,
+            )
 
             val endpoint =
-                manager.startFileManager(
-                    hotspotSsid = credentials.ssid,
-                    hotspotPassword = credentials.password,
-                    channel = credentials.channel,
-                )
+                manager
+                    .startFileManager(
+                        hotspotSsid =
+                            credentials.ssid,
+                        hotspotPassword =
+                            credentials.password,
+                        channel =
+                            credentials.channel,
+                    )
                     ?: throw IOException(
                         "TuneBuds did not report its media server address",
                     )
 
             state =
                 state.copy(
-                    detail = "D5/7: Servidor recibido: $endpoint",
-                    lastError = null,
+                    detail =
+                        "D5/7: Servidor recibido: $endpoint",
+                    lastError =
+                        null,
                 )
 
-            android.util.Log.i(TAG, state.detail)
-            onState(state)
+            android.util.Log.i(
+                TAG,
+                state.detail,
+            )
+
+            onState(
+                state,
+            )
 
             val baseUrl =
-                normalizeBaseUrl(endpoint)
+                normalizeBaseUrl(
+                    endpoint,
+                )
 
             state =
                 state.copy(
                     detail =
                         "D6/7: Leyendo ${baseUrl}media.config",
-                    lastError = null,
+                    lastError =
+                        null,
                 )
 
-            android.util.Log.i(TAG, state.detail)
-            onState(state)
+            android.util.Log.i(
+                TAG,
+                state.detail,
+            )
+
+            onState(
+                state,
+            )
 
             val manifestBody =
-                withContext(Dispatchers.IO) {
+                withContext(
+                    Dispatchers.IO,
+                ) {
                     getText(
-                        normalizeBaseUrl(baseUrl) +
+                        normalizeBaseUrl(
+                            baseUrl,
+                        ) +
                             "media.config",
                     )
                 }
@@ -357,18 +478,28 @@ class TuneBudsMediaSync(
             )
 
             val items =
-                parseManifest(manifestBody)
+                parseManifest(
+                    manifestBody,
+                )
 
             state =
                 state.copy(
-                    total = items.size,
+                    total =
+                        items.size,
                     detail =
                         "D7/7: Manifest recibido: ${items.size} archivo(s)",
-                    lastError = null,
+                    lastError =
+                        null,
                 )
 
-            android.util.Log.i(TAG, state.detail)
-            onState(state)
+            android.util.Log.i(
+                TAG,
+                state.detail,
+            )
+
+            onState(
+                state,
+            )
 
             if (items.isEmpty()) {
                 val rawPreviewForUi =
@@ -391,28 +522,42 @@ class TuneBudsMediaSync(
                     state.copy(
                         detail =
                             "D7/7: media.config sin archivos compatibles",
-                        lastError = diagnostic,
+                        lastError =
+                            diagnostic,
                     )
 
-                onState(state)
+                onState(
+                    state,
+                )
 
-                throw IOException(diagnostic)
+                throw IOException(
+                    diagnostic,
+                )
             }
 
-            var completed = 0
+            var completed =
+                0
 
             for (item in items) {
-                coroutineContext.ensureActive()
+                coroutineContext
+                    .ensureActive()
 
                 state =
                     state.copy(
                         detail =
                             "Descargando ${completed + 1}/${items.size}: ${item.fileName}",
-                        lastError = null,
+                        lastError =
+                            null,
                     )
 
-                android.util.Log.i(TAG, state.detail)
-                onState(state)
+                android.util.Log.i(
+                    TAG,
+                    state.detail,
+                )
+
+                onState(
+                    state,
+                )
 
                 val file =
                     download(
@@ -423,7 +568,10 @@ class TuneBudsMediaSync(
 
                 val imported =
                     try {
-                        onFile(item, file)
+                        onFile(
+                            item,
+                            file,
+                        )
                     } finally {
                         file.delete()
                     }
@@ -438,29 +586,53 @@ class TuneBudsMediaSync(
 
                 state =
                     state.copy(
-                        completed = completed,
+                        completed =
+                            completed,
                         detail =
                             "Importado $completed/${items.size}",
-                        lastError = null,
+                        lastError =
+                            null,
                     )
 
-                android.util.Log.i(TAG, state.detail)
-                onState(state)
+                android.util.Log.i(
+                    TAG,
+                    state.detail,
+                )
+
+                onState(
+                    state,
+                )
             }
 
             state =
                 state.copy(
-                    detail = "Sincronización completada",
-                    lastError = null,
+                    detail =
+                        "Sincronización completada",
+                    lastError =
+                        null,
                 )
 
-            android.util.Log.i(TAG, state.detail)
-            onState(state)
+            android.util.Log.i(
+                TAG,
+                state.detail,
+            )
 
-            return Result.success(completed)
-        } catch (error: CancellationException) {
+            onState(
+                state,
+            )
+
+            return Result.success(
+                completed,
+            )
+        } catch (
+            error:
+                CancellationException,
+        ) {
             throw error
-        } catch (error: Throwable) {
+        } catch (
+            error:
+                Throwable,
+        ) {
             val failedAt =
                 state.detail
 
@@ -476,22 +648,27 @@ class TuneBudsMediaSync(
 
             state =
                 state.copy(
-                    detail = "FALLO en $failedAt",
-                    lastError = message,
+                    detail =
+                        "FALLO en $failedAt",
+                    lastError =
+                        message,
                 )
 
-            onState(state)
+            onState(
+                state,
+            )
 
-            return Result.failure(error)
+            return Result.failure(
+                error,
+            )
         } finally {
-            /*
-             * Do not send CAMERA_CLOSE here on firmware 0.1.0.7.
-             */
             withContext(
                 kotlinx.coroutines.NonCancellable,
             ) {
                 hotspot.stop()
-                temporaryDirectory.deleteRecursively()
+
+                temporaryDirectory
+                    .deleteRecursively()
             }
         }
     }
@@ -499,10 +676,14 @@ class TuneBudsMediaSync(
     suspend fun fetchManifest(
         baseUrl: String,
     ): List<TuneBudsMediaItem> =
-        withContext(Dispatchers.IO) {
+        withContext(
+            Dispatchers.IO,
+        ) {
             parseManifest(
                 getText(
-                    normalizeBaseUrl(baseUrl) +
+                    normalizeBaseUrl(
+                        baseUrl,
+                    ) +
                         "media.config",
                 ),
             )
@@ -513,29 +694,42 @@ class TuneBudsMediaSync(
         item: TuneBudsMediaItem,
     ): File =
         download(
-            normalizeBaseUrl(baseUrl),
+            normalizeBaseUrl(
+                baseUrl,
+            ),
             item,
         ) { _, _, _ -> }
 
     fun parseManifest(
         body: String,
     ): List<TuneBudsMediaItem> {
+
         val trimmed =
             body.trim()
 
         val names =
             runCatching {
                 when {
-                    trimmed.startsWith("[") -> {
+                    trimmed.startsWith(
+                        "[",
+                    ) -> {
                         stringsFromArray(
-                            JSONArray(trimmed),
+                            JSONArray(
+                                trimmed,
+                            ),
                         )
                     }
 
-                    trimmed.startsWith("{") -> {
+                    trimmed.startsWith(
+                        "{",
+                    ) -> {
                         stringsFromArray(
-                            JSONObject(trimmed)
-                                .optJSONArray("files")
+                            JSONObject(
+                                trimmed,
+                            )
+                                .optJSONArray(
+                                    "files",
+                                )
                                 ?: JSONArray(),
                         )
                     }
@@ -544,21 +738,31 @@ class TuneBudsMediaSync(
                         emptyList()
                 }
             }
-                .getOrDefault(emptyList())
+                .getOrDefault(
+                    emptyList(),
+                )
                 .ifEmpty {
                     trimmed
                         .lineSequence()
-                        .map(String::trim)
+                        .map(
+                            String::trim,
+                        )
                         .filter {
                             it.isNotBlank() &&
-                                !it.startsWith("HTTP/") &&
-                                !it.contains(": ")
+                                !it.startsWith(
+                                    "HTTP/",
+                                ) &&
+                                !it.contains(
+                                    ": ",
+                                )
                         }
                         .toList()
                 }
 
         return names
-            .mapNotNull(::mediaItem)
+            .mapNotNull(
+                ::mediaItem,
+            )
             .distinctBy {
                 it.remoteName
             }
@@ -574,284 +778,134 @@ class TuneBudsMediaSync(
                 Long,
             ) -> Unit,
     ): File =
-        withContext(Dispatchers.IO) {
+        withContext(
+            Dispatchers.IO,
+        ) {
             val output =
                 File(
                     temporaryDirectory,
                     item.fileName,
                 ).apply {
                     parentFile?.mkdirs()
+
                     delete()
                 }
 
             val mediaUrl =
                 baseUrl +
-                    encodePath(item.remoteName)
+                    encodePath(
+                        item.remoteName,
+                    )
 
-            var expectedTotal =
+            var lastFailure:
+                Throwable? = null
+
+            var lastAdvertisedLength =
                 -1L
 
-            var attempt =
-                0
+            repeat(
+                MEDIA_DOWNLOAD_MAX_ATTEMPTS,
+            ) { index ->
 
-            var lastFailure: IOException? =
-                null
+                coroutineContext
+                    .ensureActive()
 
-            while (attempt < MEDIA_DOWNLOAD_MAX_ATTEMPTS) {
-                coroutineContext.ensureActive()
+                output.delete()
 
-                val requestedOffset =
-                    output.length()
+                val attempt =
+                    index + 1
 
-                val requestBuilder =
-                    Request.Builder()
-                        .url(mediaUrl)
-                        .header(
-                            "Connection",
-                            "close",
-                        )
-                        .header(
-                            "User-Agent",
-                            "TSClient/1.0",
-                        )
-                        .header(
-                            "Accept-Encoding",
-                            "identity",
-                        )
-
-                if (requestedOffset > 0L) {
-                    requestBuilder.header(
-                        "Range",
-                        "bytes=$requestedOffset-",
-                    )
-
-                    android.util.Log.i(
-                        TAG,
-                        "Resuming ${item.fileName} " +
-                            "from byte $requestedOffset " +
-                            "(attempt ${attempt + 1})",
-                    )
-                } else {
-                    android.util.Log.i(
-                        TAG,
-                        "HTTP GET media file: ${item.remoteName} " +
-                            "(attempt ${attempt + 1})",
-                    )
-                }
-
-                val request =
-                    requestBuilder
-                        .get()
-                        .build()
+                android.util.Log.i(
+                    TAG,
+                    "RAW HTTP media download " +
+                        "attempt $attempt/" +
+                        "$MEDIA_DOWNLOAD_MAX_ATTEMPTS: " +
+                        item.remoteName,
+                )
 
                 try {
-                    CLIENT
-                        .newCall(request)
-                        .execute()
-                        .use { response ->
-                            if (!response.isSuccessful) {
-                                throw IOException(
-                                    "TuneBuds HTTP ${response.code} " +
-                                        "for ${item.fileName}",
-                                )
-                            }
+                    val result =
+                        rawHttpDownload(
+                            mediaUrl,
+                            output,
+                            item,
+                            onProgress,
+                        )
 
-                            var writeOffset =
-                                requestedOffset
-
-                            /*
-                             * A resumed request should normally return 206.
-                             *
-                             * If the server ignores Range and returns 200,
-                             * restart the local file instead of appending a
-                             * second complete copy.
-                             */
-                            if (
-                                requestedOffset > 0L &&
-                                response.code == 200
-                            ) {
-                                android.util.Log.w(
-                                    TAG,
-                                    "TuneBuds ignored Range for " +
-                                        "${item.fileName}; restarting file",
-                                )
-
-                                output.delete()
-                                output.createNewFile()
-
-                                writeOffset = 0L
-                            }
-
-                            val contentRange =
-                                response.header(
-                                    "Content-Range",
-                                )
-
-                            val rangeStart =
-                                contentRangeStart(
-                                    contentRange,
-                                )
-
-                            val rangeTotal =
-                                contentRangeTotal(
-                                    contentRange,
-                                )
-
-                            if (
-                                response.code == 206 &&
-                                requestedOffset > 0L &&
-                                rangeStart != null &&
-                                rangeStart != requestedOffset
-                            ) {
-                                throw IOException(
-                                    "TuneBuds resumed at byte " +
-                                        "$rangeStart instead of " +
-                                        "$requestedOffset",
-                                )
-                            }
-
-                            val body =
-                                response.body
-                                    ?: throw IOException(
-                                        "TuneBuds returned no data " +
-                                            "for ${item.fileName}",
-                                    )
-
-                            val responseLength =
-                                body.contentLength()
-
-                            if (rangeTotal != null) {
-                                expectedTotal =
-                                    rangeTotal
-                            } else if (
-                                response.code == 200 &&
-                                responseLength >= 0L
-                            ) {
-                                expectedTotal =
-                                    responseLength
-                            }
-
-                            android.util.Log.i(
-                                TAG,
-                                "Media HTTP response=${response.code}, " +
-                                    "responseLength=$responseLength, " +
-                                    "expectedTotal=$expectedTotal, " +
-                                    "offset=$writeOffset, " +
-                                    "file=${item.fileName}",
-                            )
-
-                            var copied =
-                                writeOffset
-
-                            body
-                                .byteStream()
-                                .use { input ->
-                                    FileOutputStream(
-                                        output,
-                                        writeOffset > 0L,
-                                    )
-                                        .buffered(
-                                            128 * 1024,
-                                        )
-                                        .use { target ->
-                                            val buffer =
-                                                ByteArray(
-                                                    128 * 1024,
-                                                )
-
-                                            while (true) {
-                                                coroutineContext.ensureActive()
-
-                                                val count =
-                                                    input.read(
-                                                        buffer,
-                                                    )
-
-                                                if (count <= 0) {
-                                                    break
-                                                }
-
-                                                target.write(
-                                                    buffer,
-                                                    0,
-                                                    count,
-                                                )
-
-                                                copied +=
-                                                    count
-
-                                                onProgress(
-                                                    item,
-                                                    copied,
-                                                    expectedTotal,
-                                                )
-                                            }
-                                        }
-                                }
-
-                            /*
-                             * A clean EOF is only success when the number
-                             * of bytes agrees with the announced total.
-                             */
-                            if (
-                                expectedTotal > 0L &&
-                                copied < expectedTotal
-                            ) {
-                                throw IOException(
-                                    "TuneBuds stream ended early at " +
-                                        "$copied/$expectedTotal bytes",
-                                )
-                            }
-
-                            android.util.Log.i(
-                                TAG,
-                                "Media download completed: " +
-                                    "$copied bytes for ${item.fileName}",
-                            )
-                        }
-
-                    return@withContext output
-                } catch (error: IOException) {
-                    lastFailure =
-                        error
-
-                    attempt++
-
-                    val currentSize =
-                        output.length()
-
-                    android.util.Log.w(
-                        TAG,
-                        "Media download interrupted: " +
-                            "${item.fileName}, " +
-                            "received=$currentSize, " +
-                            "expected=$expectedTotal, " +
-                            "attempt=$attempt/" +
-                            "$MEDIA_DOWNLOAD_MAX_ATTEMPTS, " +
-                            "error=${error.message}",
-                        error,
-                    )
+                    lastAdvertisedLength =
+                        result.advertisedLength
 
                     if (
-                        expectedTotal > 0L &&
-                        currentSize >= expectedTotal
+                        result.readError != null
                     ) {
+                        lastFailure =
+                            result.readError
+
+                        android.util.Log.w(
+                            TAG,
+                            "RAW HTTP stream closed with error " +
+                                "after ${result.copied} bytes: " +
+                                result.readError.message,
+                        )
+                    }
+
+                    val valid =
+                        validateDownloadedMedia(
+                            item,
+                            output,
+                        )
+
+                    android.util.Log.i(
+                        TAG,
+                        "RAW HTTP received=${output.length()}, " +
+                            "advertised=${result.advertisedLength}, " +
+                            "valid=$valid, " +
+                            "file=${item.fileName}",
+                    )
+
+                    if (valid) {
                         android.util.Log.i(
                             TAG,
-                            "Partial download already reached " +
-                                "expected size; accepting file",
+                            "Media accepted after RAW HTTP: " +
+                                "${output.length()} bytes",
                         )
 
                         return@withContext output
                     }
 
                     if (
-                        attempt >=
-                        MEDIA_DOWNLOAD_MAX_ATTEMPTS
+                        result.readError == null
                     ) {
-                        break
+                        lastFailure =
+                            IOException(
+                                "Downloaded media is structurally incomplete",
+                            )
                     }
+                } catch (
+                    error:
+                        CancellationException,
+                ) {
+                    throw error
+                } catch (
+                    error:
+                        Throwable,
+                ) {
+                    lastFailure =
+                        error
 
+                    android.util.Log.w(
+                        TAG,
+                        "RAW HTTP attempt $attempt failed: " +
+                            (error.message
+                                ?: error.javaClass.simpleName),
+                        error,
+                    )
+                }
+
+                if (
+                    attempt <
+                    MEDIA_DOWNLOAD_MAX_ATTEMPTS
+                ) {
                     delay(
                         MEDIA_DOWNLOAD_RETRY_MS,
                     )
@@ -859,25 +913,687 @@ class TuneBudsMediaSync(
             }
 
             throw IOException(
-                "TuneBuds media download failed after " +
-                    "$MEDIA_DOWNLOAD_MAX_ATTEMPTS attempts " +
-                    "at ${output.length()}/" +
-                    "${if (expectedTotal > 0L) expectedTotal else "?"} bytes",
+                "TuneBuds RAW media download failed " +
+                    "after $MEDIA_DOWNLOAD_MAX_ATTEMPTS attempts; " +
+                    "last=${output.length()} bytes, " +
+                    "advertised=" +
+                    if (
+                        lastAdvertisedLength > 0L
+                    ) {
+                        lastAdvertisedLength
+                    } else {
+                        "?"
+                    },
                 lastFailure,
             )
         }
 
+    private suspend fun rawHttpDownload(
+        urlString: String,
+        output: File,
+        item: TuneBudsMediaItem,
+        onProgress:
+            suspend (
+                TuneBudsMediaItem,
+                Long,
+                Long,
+            ) -> Unit,
+    ): RawHttpDownloadResult {
+
+        val url =
+            URL(
+                urlString,
+            )
+
+        if (
+            !url.protocol.equals(
+                "http",
+                ignoreCase = true,
+            )
+        ) {
+            throw IOException(
+                "RAW TuneBuds transfer only supports HTTP",
+            )
+        }
+
+        val port =
+            if (
+                url.port > 0
+            ) {
+                url.port
+            } else {
+                80
+            }
+
+        val path =
+            if (
+                url.file.isNullOrBlank()
+            ) {
+                "/"
+            } else {
+                url.file
+            }
+
+        val socket =
+            Socket()
+
+        try {
+            socket.soTimeout =
+                RAW_HTTP_READ_TIMEOUT_MS
+
+            socket.connect(
+                InetSocketAddress(
+                    url.host,
+                    port,
+                ),
+                RAW_HTTP_CONNECT_TIMEOUT_MS,
+            )
+
+            val networkOutput =
+                BufferedOutputStream(
+                    socket.getOutputStream(),
+                )
+
+            val hostHeader =
+                if (
+                    port == 80
+                ) {
+                    url.host
+                } else {
+                    "${url.host}:$port"
+                }
+
+            val request =
+                buildString {
+                    append(
+                        "GET $path HTTP/1.1\r\n",
+                    )
+
+                    append(
+                        "Host: $hostHeader\r\n",
+                    )
+
+                    append(
+                        "User-Agent: TSClient/1.0\r\n",
+                    )
+
+                    append(
+                        "Connection: close\r\n",
+                    )
+
+                    append(
+                        "Accept: */*\r\n",
+                    )
+
+                    append(
+                        "Accept-Encoding: identity\r\n",
+                    )
+
+                    append(
+                        "\r\n",
+                    )
+                }
+
+            networkOutput.write(
+                request.toByteArray(
+                    StandardCharsets.US_ASCII,
+                ),
+            )
+
+            networkOutput.flush()
+
+            val input =
+                BufferedInputStream(
+                    socket.getInputStream(),
+                    128 * 1024,
+                )
+
+            val statusLine =
+                readHttpLine(
+                    input,
+                )
+                    ?: throw IOException(
+                        "TuneBuds returned no HTTP status",
+                    )
+
+            val statusCode =
+                statusLine
+                    .split(
+                        ' ',
+                    )
+                    .getOrNull(
+                        1,
+                    )
+                    ?.toIntOrNull()
+                    ?: throw IOException(
+                        "Invalid TuneBuds HTTP status: $statusLine",
+                    )
+
+            if (
+                statusCode !in 200..299
+            ) {
+                throw IOException(
+                    "TuneBuds HTTP $statusCode for ${item.fileName}",
+                )
+            }
+
+            val headers =
+                mutableMapOf<
+                    String,
+                    String,
+                >()
+
+            while (true) {
+                val line =
+                    readHttpLine(
+                        input,
+                    )
+                        ?: break
+
+                if (
+                    line.isEmpty()
+                ) {
+                    break
+                }
+
+                val separator =
+                    line.indexOf(
+                        ':',
+                    )
+
+                if (
+                    separator > 0
+                ) {
+                    val name =
+                        line
+                            .substring(
+                                0,
+                                separator,
+                            )
+                            .trim()
+                            .lowercase()
+
+                    val value =
+                        line
+                            .substring(
+                                separator + 1,
+                            )
+                            .trim()
+
+                    headers[name] =
+                        value
+                }
+            }
+
+            val transferEncoding =
+                headers[
+                    "transfer-encoding"
+                ]
+
+            if (
+                transferEncoding
+                    ?.contains(
+                        "chunked",
+                        ignoreCase = true,
+                    ) == true
+            ) {
+                throw IOException(
+                    "TuneBuds returned chunked HTTP, unsupported in RAW diagnostic",
+                )
+            }
+
+            val advertisedLength =
+                headers[
+                    "content-length"
+                ]
+                    ?.toLongOrNull()
+                    ?: -1L
+
+            android.util.Log.i(
+                TAG,
+                "RAW HTTP response=$statusCode, " +
+                    "contentLength=$advertisedLength, " +
+                    "connection=${headers["connection"]}, " +
+                    "file=${item.fileName}",
+            )
+
+            var copied =
+                0L
+
+            var readError:
+                IOException? = null
+
+            output
+                .outputStream()
+                .buffered(
+                    128 * 1024,
+                )
+                .use { target ->
+
+                    val buffer =
+                        ByteArray(
+                            128 * 1024,
+                        )
+
+                    while (true) {
+                        coroutineContext
+                            .ensureActive()
+
+                        val count =
+                            try {
+                                input.read(
+                                    buffer,
+                                )
+                            } catch (
+                                error:
+                                    IOException,
+                            ) {
+                                readError =
+                                    error
+
+                                break
+                            }
+
+                        if (
+                            count < 0
+                        ) {
+                            break
+                        }
+
+                        if (
+                            count == 0
+                        ) {
+                            continue
+                        }
+
+                        target.write(
+                            buffer,
+                            0,
+                            count,
+                        )
+
+                        copied +=
+                            count
+
+                        onProgress(
+                            item,
+                            copied,
+                            advertisedLength,
+                        )
+                    }
+
+                    target.flush()
+                }
+
+            return RawHttpDownloadResult(
+                copied =
+                    copied,
+                advertisedLength =
+                    advertisedLength,
+                readError =
+                    readError,
+            )
+        } finally {
+            runCatching {
+                socket.close()
+            }
+        }
+    }
+
+    private fun readHttpLine(
+        input:
+            BufferedInputStream,
+    ): String? {
+
+        val bytes =
+            mutableListOf<
+                Byte,
+            >()
+
+        var sawAnyByte =
+            false
+
+        while (true) {
+            val value =
+                input.read()
+
+            if (
+                value < 0
+            ) {
+                if (
+                    !sawAnyByte
+                ) {
+                    return null
+                }
+
+                break
+            }
+
+            sawAnyByte =
+                true
+
+            if (
+                value == '\n'.code
+            ) {
+                break
+            }
+
+            if (
+                value != '\r'.code
+            ) {
+                bytes.add(
+                    value.toByte(),
+                )
+            }
+
+            if (
+                bytes.size >
+                16 * 1024
+            ) {
+                throw IOException(
+                    "TuneBuds returned an oversized HTTP header line",
+                )
+            }
+        }
+
+        return String(
+            bytes.toByteArray(),
+            StandardCharsets.ISO_8859_1,
+        )
+    }
+
+    private fun validateDownloadedMedia(
+        item: TuneBudsMediaItem,
+        file: File,
+    ): Boolean {
+
+        if (
+            !file.exists() ||
+            file.length() <= 0L
+        ) {
+            return false
+        }
+
+        return when (
+            item.type
+        ) {
+            TuneBudsMediaType.VIDEO ->
+                isCompleteMp4(
+                    file,
+                )
+
+            TuneBudsMediaType.PHOTO ->
+                isCompleteJpeg(
+                    file,
+                )
+
+            TuneBudsMediaType.AUDIO ->
+                isPlausibleAudio(
+                    file,
+                )
+        }
+    }
+
+    private fun isCompleteMp4(
+        file: File,
+    ): Boolean {
+
+        if (
+            file.length() < 16L
+        ) {
+            return false
+        }
+
+        return runCatching {
+            RandomAccessFile(
+                file,
+                "r",
+            ).use { raf ->
+
+                val fileLength =
+                    raf.length()
+
+                var position =
+                    0L
+
+                var hasFtyp =
+                    false
+
+                var hasMoov =
+                    false
+
+                var hasMdat =
+                    false
+
+                while (
+                    position <
+                    fileLength
+                ) {
+                    if (
+                        fileLength - position <
+                        8L
+                    ) {
+                        return@use false
+                    }
+
+                    raf.seek(
+                        position,
+                    )
+
+                    val size32 =
+                        raf
+                            .readInt()
+                            .toLong() and
+                            0xffffffffL
+
+                    val typeBytes =
+                        ByteArray(
+                            4,
+                        )
+
+                    raf.readFully(
+                        typeBytes,
+                    )
+
+                    val type =
+                        String(
+                            typeBytes,
+                            StandardCharsets.ISO_8859_1,
+                        )
+
+                    var headerSize =
+                        8L
+
+                    val boxSize =
+                        when (
+                            size32
+                        ) {
+                            0L -> {
+                                fileLength -
+                                    position
+                            }
+
+                            1L -> {
+                                if (
+                                    fileLength -
+                                    position <
+                                    16L
+                                ) {
+                                    return@use false
+                                }
+
+                                headerSize =
+                                    16L
+
+                                val extended =
+                                    raf.readLong()
+
+                                if (
+                                    extended <= 0L
+                                ) {
+                                    return@use false
+                                }
+
+                                extended
+                            }
+
+                            else ->
+                                size32
+                        }
+
+                    if (
+                        boxSize <
+                        headerSize
+                    ) {
+                        return@use false
+                    }
+
+                    val end =
+                        position +
+                            boxSize
+
+                    if (
+                        end <
+                        position ||
+                        end >
+                        fileLength
+                    ) {
+                        return@use false
+                    }
+
+                    when (
+                        type
+                    ) {
+                        "ftyp" ->
+                            hasFtyp =
+                                true
+
+                        "moov" ->
+                            hasMoov =
+                                true
+
+                        "mdat" ->
+                            hasMdat =
+                                true
+                    }
+
+                    position =
+                        end
+                }
+
+                position ==
+                    fileLength &&
+                    hasFtyp &&
+                    hasMoov &&
+                    hasMdat
+            }
+        }
+            .getOrDefault(
+                false,
+            )
+    }
+
+    private fun isCompleteJpeg(
+        file: File,
+    ): Boolean {
+
+        if (
+            file.length() < 4L
+        ) {
+            return false
+        }
+
+        return runCatching {
+            RandomAccessFile(
+                file,
+                "r",
+            ).use { raf ->
+
+                val startA =
+                    raf.readUnsignedByte()
+
+                val startB =
+                    raf.readUnsignedByte()
+
+                raf.seek(
+                    raf.length() -
+                        2L,
+                )
+
+                val endA =
+                    raf.readUnsignedByte()
+
+                val endB =
+                    raf.readUnsignedByte()
+
+                startA == 0xFF &&
+                    startB == 0xD8 &&
+                    endA == 0xFF &&
+                    endB == 0xD9
+            }
+        }
+            .getOrDefault(
+                false,
+            )
+    }
+
+    private fun isPlausibleAudio(
+        file: File,
+    ): Boolean {
+
+        if (
+            file.length() < 12L
+        ) {
+            return false
+        }
+
+        return runCatching {
+            RandomAccessFile(
+                file,
+                "r",
+            ).use { raf ->
+
+                val header =
+                    ByteArray(
+                        12,
+                    )
+
+                raf.readFully(
+                    header,
+                )
+
+                val prefix4 =
+                    String(
+                        header,
+                        0,
+                        4,
+                        StandardCharsets.ISO_8859_1,
+                    )
+
+                prefix4 == "OggS" ||
+                    prefix4 == "RIFF"
+            }
+        }
+            .getOrDefault(
+                false,
+            )
+    }
+
     private fun getText(
         url: String,
     ): String {
+
         android.util.Log.i(
             TAG,
             "HTTP GET $url",
         )
 
         val request =
-            Request.Builder()
-                .url(url)
+            Request
+                .Builder()
+                .url(
+                    url,
+                )
                 .header(
                     "Connection",
                     "close",
@@ -890,15 +1606,20 @@ class TuneBudsMediaSync(
                 .build()
 
         CLIENT
-            .newCall(request)
+            .newCall(
+                request,
+            )
             .execute()
             .use { response ->
+
                 android.util.Log.i(
                     TAG,
                     "media.config HTTP response=${response.code}",
                 )
 
-                if (!response.isSuccessful) {
+                if (
+                    !response.isSuccessful
+                ) {
                     throw IOException(
                         "TuneBuds HTTP ${response.code} for media.config",
                     )
@@ -913,82 +1634,54 @@ class TuneBudsMediaSync(
             }
     }
 
-    private fun contentRangeStart(
-        value: String?,
-    ): Long? {
-        if (value.isNullOrBlank()) {
-            return null
-        }
-
-        val range =
-            value
-                .substringAfter(
-                    "bytes ",
-                    "",
-                )
-                .substringBefore('/')
-
-        if (range.isBlank()) {
-            return null
-        }
-
-        return range
-            .substringBefore('-')
-            .trim()
-            .toLongOrNull()
-    }
-
-    private fun contentRangeTotal(
-        value: String?,
-    ): Long? {
-        if (value.isNullOrBlank()) {
-            return null
-        }
-
-        val total =
-            value
-                .substringAfter(
-                    '/',
-                    "",
-                )
-                .trim()
-
-        if (
-            total.isBlank() ||
-            total == "*"
-        ) {
-            return null
-        }
-
-        return total.toLongOrNull()
-    }
-
     private fun manifestPreview(
         body: String,
         limit: Int,
     ): String {
-        if (body.isEmpty()) {
+
+        if (
+            body.isEmpty()
+        ) {
             return "<VACÍO>"
         }
 
         val escaped =
             buildString {
                 body.forEach { char ->
-                    when (char) {
-                        '\r' -> append("\\r")
-                        '\n' -> append("\\n")
-                        '\t' -> append("\\t")
+                    when (
+                        char
+                    ) {
+                        '\r' ->
+                            append(
+                                "\\r",
+                            )
+
+                        '\n' ->
+                            append(
+                                "\\n",
+                            )
+
+                        '\t' ->
+                            append(
+                                "\\t",
+                            )
+
                         else -> {
                             if (
-                                char.code in 0x20..0x7E ||
-                                char.code >= 0xA0
+                                char.code in
+                                0x20..0x7E ||
+                                char.code >=
+                                0xA0
                             ) {
-                                append(char)
+                                append(
+                                    char,
+                                )
                             } else {
                                 append(
-                                    "\\u%04x".format(
-                                        char.code,
-                                    ),
+                                    "\\u%04x"
+                                        .format(
+                                            char.code,
+                                        ),
                                 )
                             }
                         }
@@ -996,10 +1689,15 @@ class TuneBudsMediaSync(
                 }
             }
 
-        return if (escaped.length <= limit) {
+        return if (
+            escaped.length <=
+            limit
+        ) {
             escaped
         } else {
-            escaped.take(limit) + "…"
+            escaped.take(
+                limit,
+            ) + "…"
         }
     }
 
@@ -1007,19 +1705,33 @@ class TuneBudsMediaSync(
         array: JSONArray,
     ): List<String> =
         buildList {
-            for (index in 0 until array.length()) {
+            for (
+                index in
+                0 until
+                array.length()
+            ) {
                 when (
                     val value =
-                        array.opt(index)
+                        array.opt(
+                            index,
+                        )
                 ) {
                     is String ->
-                        add(value)
+                        add(
+                            value,
+                        )
 
                     is JSONObject -> {
                         value
-                            .optString("name")
-                            .takeIf(String::isNotBlank)
-                            ?.let(::add)
+                            .optString(
+                                "name",
+                            )
+                            .takeIf(
+                                String::isNotBlank,
+                            )
+                            ?.let(
+                                ::add,
+                            )
                     }
                 }
             }
@@ -1028,40 +1740,64 @@ class TuneBudsMediaSync(
     private fun mediaItem(
         value: String,
     ): TuneBudsMediaItem? {
+
         val remote =
             value
                 .trim()
-                .replace('\\', '/')
-                .trimStart('/')
+                .replace(
+                    '\\',
+                    '/',
+                )
+                .trimStart(
+                    '/',
+                )
 
         if (
             remote.isBlank() ||
-            remote.contains("../")
+            remote.contains(
+                "../",
+            )
         ) {
             return null
         }
 
         var fileName =
-            File(remote).name
+            File(
+                remote,
+            ).name
 
         val lower =
             fileName.lowercase()
 
         val type =
             when {
-                lower.endsWith(".jpg") ||
-                    lower.endsWith(".jpeg") -> {
+                lower.endsWith(
+                    ".jpg",
+                ) ||
+                    lower.endsWith(
+                        ".jpeg",
+                    ) -> {
                     TuneBudsMediaType.PHOTO
                 }
 
-                lower.endsWith(".mp4") ||
-                    lower.startsWith("video-") -> {
+                lower.endsWith(
+                    ".mp4",
+                ) ||
+                    lower.startsWith(
+                        "video-",
+                    ) -> {
                     TuneBudsMediaType.VIDEO
                 }
 
-                lower.endsWith(".opus") ||
-                    lower.endsWith(".ogg") ||
-                    lower.endsWith(".wav") -> {
+                lower.endsWith(
+                    ".opus",
+                ) ||
+                    lower.endsWith(
+                        ".ogg",
+                    ) ||
+                    lower.endsWith(
+                        ".wav",
+                    ) -> {
                     TuneBudsMediaType.AUDIO
                 }
 
@@ -1070,33 +1806,48 @@ class TuneBudsMediaSync(
             }
 
         if (
-            type == TuneBudsMediaType.VIDEO &&
-            '.' !in fileName
+            type ==
+            TuneBudsMediaType.VIDEO &&
+            '.' !in
+            fileName
         ) {
-            fileName += ".mp4"
+            fileName +=
+                ".mp4"
         }
 
         return TuneBudsMediaItem(
-            remoteName = remote,
-            fileName = fileName,
-            type = type,
+            remoteName =
+                remote,
+            fileName =
+                fileName,
+            type =
+                type,
         )
     }
 
     private fun normalizeBaseUrl(
         value: String,
     ): String {
+
         val trimmed =
             value.trim()
 
         require(
-            trimmed.startsWith("http://") ||
-                trimmed.startsWith("https://"),
+            trimmed.startsWith(
+                "http://",
+            ) ||
+                trimmed.startsWith(
+                    "https://",
+                ),
         ) {
             "TuneBuds returned an invalid media server address"
         }
 
-        return if (trimmed.endsWith('/')) {
+        return if (
+            trimmed.endsWith(
+                '/',
+            )
+        ) {
             trimmed
         } else {
             "$trimmed/"
@@ -1107,13 +1858,20 @@ class TuneBudsMediaSync(
         path: String,
     ): String =
         path
-            .split('/')
-            .filter(String::isNotBlank)
-            .joinToString("/") { segment ->
+            .split(
+                '/',
+            )
+            .filter(
+                String::isNotBlank,
+            )
+            .joinToString(
+                "/",
+            ) { segment ->
                 URLEncoder
                     .encode(
                         segment,
-                        StandardCharsets.UTF_8.name(),
+                        StandardCharsets.UTF_8
+                            .name(),
                     )
                     .replace(
                         "+",
