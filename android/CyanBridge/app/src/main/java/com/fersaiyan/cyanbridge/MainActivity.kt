@@ -7789,6 +7789,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             return
         }
 
+        // TuneBuds uses its own SPP transport and does not use the legacy
+        // Oudmon/HeyCyan one-shot response slot. A stale legacy command
+        // must not block TuneBuds media synchronization.
+        if (!GlassesSessionCoordinator.canRunBackgroundCommand()) {
+            Log.w(
+                "TuneBudsMediaSync",
+                "Clearing stale legacy background-command lock before TuneBuds sync",
+            )
+            GlassesSessionCoordinator.clearBackgroundCommands()
+        }
+
         val lease = acquireExclusiveGlassesSession(GlassesSession.MEDIA_SYNC) ?: return
         mediaSessionLease = lease
         tuneBudsMediaCancelled = false
