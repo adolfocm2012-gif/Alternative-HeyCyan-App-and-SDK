@@ -416,11 +416,6 @@ class TuneBudsMediaSync(
 
                 onState(state)
 
-                /*
-                 * Diagnostic build:
-                 * fail intentionally when the parser finds zero items
-                 * so MainActivity's final Toast shows the raw response.
-                 */
                 throw IOException(diagnostic)
             }
 
@@ -618,8 +613,21 @@ class TuneBudsMediaSync(
                         baseUrl +
                             encodePath(item.remoteName),
                     )
+                    .header(
+                        "Connection",
+                        "close",
+                    )
+                    .header(
+                        "User-Agent",
+                        "TSClient/1.0",
+                    )
                     .get()
                     .build()
+
+            android.util.Log.i(
+                TAG,
+                "HTTP GET media file: ${item.remoteName}",
+            )
 
             CLIENT
                 .newCall(request)
@@ -639,6 +647,12 @@ class TuneBudsMediaSync(
 
                     val total =
                         body.contentLength()
+
+                    android.util.Log.i(
+                        TAG,
+                        "Media HTTP response=${response.code}, " +
+                            "length=$total, file=${item.fileName}",
+                    )
 
                     var copied =
                         0L
@@ -679,6 +693,12 @@ class TuneBudsMediaSync(
                                     }
                                 }
                         }
+
+                    android.util.Log.i(
+                        TAG,
+                        "Media download completed: " +
+                            "$copied bytes for ${item.fileName}",
+                    )
                 }
 
             output
