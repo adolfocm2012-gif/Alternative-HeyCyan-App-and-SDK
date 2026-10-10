@@ -58,14 +58,12 @@ class TuneBudsLocalHotspot(context: Context) {
 
         return withTimeout(START_TIMEOUT_MS) {
             suspendCancellableCoroutine { continuation ->
-
                 continuation.invokeOnCancellation {
                     stop()
                 }
 
                 wifiManager.startLocalOnlyHotspot(
                     object : WifiManager.LocalOnlyHotspotCallback() {
-
                         override fun onStarted(
                             startedReservation:
                                 WifiManager.LocalOnlyHotspotReservation,
@@ -78,22 +76,17 @@ class TuneBudsLocalHotspot(context: Context) {
                             reservation = startedReservation
 
                             val credentials =
-                                readCredentials(
-                                    startedReservation,
-                                )
+                                readCredentials(startedReservation)
 
                             if (credentials == null) {
                                 stop()
-
                                 continuation.resumeWithException(
                                     IOException(
                                         "Android returned empty hotspot credentials",
                                     ),
                                 )
                             } else {
-                                continuation.resume(
-                                    credentials,
-                                )
+                                continuation.resume(credentials)
                             }
                         }
 
@@ -109,9 +102,7 @@ class TuneBudsLocalHotspot(context: Context) {
                             }
                         }
 
-                        override fun onFailed(
-                            reason: Int,
-                        ) {
+                        override fun onFailed(reason: Int) {
                             reservation = null
 
                             if (continuation.isActive) {
@@ -123,9 +114,7 @@ class TuneBudsLocalHotspot(context: Context) {
                             }
                         }
                     },
-                    Handler(
-                        Looper.getMainLooper(),
-                    ),
+                    Handler(Looper.getMainLooper()),
                 )
             }
         }
@@ -133,7 +122,6 @@ class TuneBudsLocalHotspot(context: Context) {
 
     fun stop() {
         val current = reservation
-
         reservation = null
 
         runCatching {
@@ -143,10 +131,8 @@ class TuneBudsLocalHotspot(context: Context) {
 
     @Suppress("DEPRECATION")
     private fun readCredentials(
-        current:
-            WifiManager.LocalOnlyHotspotReservation,
+        current: WifiManager.LocalOnlyHotspotReservation,
     ): TuneBudsHotspotCredentials? {
-
         val ssid: String?
         val password: String?
         val channel: Int
@@ -155,8 +141,7 @@ class TuneBudsLocalHotspot(context: Context) {
             Build.VERSION.SDK_INT >=
             Build.VERSION_CODES.TIRAMISU
         ) {
-            val configuration:
-                SoftApConfiguration =
+            val configuration: SoftApConfiguration =
                 current.softApConfiguration
 
             ssid = configuration.ssid
@@ -167,8 +152,7 @@ class TuneBudsLocalHotspot(context: Context) {
                 current.wifiConfiguration
 
             ssid = configuration?.SSID
-            password =
-                configuration?.preSharedKey
+            password = configuration?.preSharedKey
             channel = 0
         }
 
@@ -180,20 +164,14 @@ class TuneBudsLocalHotspot(context: Context) {
         }
 
         return TuneBudsHotspotCredentials(
-            ssid,
-            password,
-            channel.coerceIn(
-                0,
-                0xFF,
-            ),
+            ssid = ssid,
+            password = password,
+            channel = channel.coerceIn(0, 0xFF),
         )
     }
 
-    private fun hasWifiPermission(): Boolean {
-        return hasWifiP2pPermission(
-            context,
-        )
-    }
+    private fun hasWifiPermission(): Boolean =
+        hasWifiP2pPermission(context)
 }
 
 enum class TuneBudsMediaType {
@@ -225,23 +203,15 @@ class TuneBudsMediaSync(
     private val temporaryDirectory: File,
 ) {
     companion object {
-        private const val TAG =
-            "TuneBudsMediaSync"
+        private const val TAG = "TuneBudsMediaSync"
+        private const val RAW_PREVIEW_UI_LIMIT = 240
+        private const val RAW_PREVIEW_LOG_LIMIT = 4_000
 
         private val CLIENT =
             OkHttpClient.Builder()
-                .connectTimeout(
-                    20,
-                    TimeUnit.SECONDS,
-                )
-                .readTimeout(
-                    120,
-                    TimeUnit.SECONDS,
-                )
-                .writeTimeout(
-                    30,
-                    TimeUnit.SECONDS,
-                )
+                .connectTimeout(20, TimeUnit.SECONDS)
+                .readTimeout(120, TimeUnit.SECONDS)
+                .writeTimeout(30, TimeUnit.SECONDS)
                 .build()
     }
 
@@ -260,51 +230,35 @@ class TuneBudsMediaSync(
                 File,
             ) -> Boolean,
     ): Result<Int> {
-
         var state =
             TuneBudsMediaSyncState(
-                detail =
-                    "D1/7: Finalizando cámara",
+                detail = "D1/7: Finalizando cámara",
             )
 
-        android.util.Log.i(
-            TAG,
-            state.detail,
-        )
-
+        android.util.Log.i(TAG, state.detail)
         onState(state)
 
         temporaryDirectory.mkdirs()
 
         try {
-
             /*
              * D1
-             *
-             * Close the camera subsystem before
-             * asking the glasses to expose files.
+             * Close the camera subsystem before asking
+             * the glasses to expose files.
              */
-
             val cleanupResult =
                 runCatching {
                     manager.finishTransferBlocking()
                 }
 
-            if (
-                cleanupResult.isSuccess
-            ) {
+            if (cleanupResult.isSuccess) {
                 state =
                     state.copy(
-                        detail =
-                            "D1/7: Cámara preparada",
+                        detail = "D1/7: Cámara preparada",
                         lastError = null,
                     )
 
-                android.util.Log.i(
-                    TAG,
-                    state.detail,
-                )
-
+                android.util.Log.i(TAG, state.detail)
                 onState(state)
             } else {
                 val message =
@@ -321,41 +275,30 @@ class TuneBudsMediaSync(
 
                 state =
                     state.copy(
-                        detail =
-                            "D1/7: Aviso al cerrar cámara",
-                        lastError =
-                            message,
+                        detail = "D1/7: Aviso al cerrar cámara",
+                        lastError = message,
                     )
 
                 onState(state)
 
                 /*
                  * Do not abort here.
-                 * Some firmware answers oddly to
-                 * CAMERA_CLOSE even when media is
-                 * already safely stored.
+                 * Some firmware answers oddly to CAMERA_CLOSE
+                 * even when media is already safely stored.
                  */
             }
 
             /*
              * D2
-             *
-             * Ask Android to create a local-only
-             * hotspot.
+             * Ask Android to create a local-only hotspot.
              */
-
             state =
                 state.copy(
-                    detail =
-                        "D2/7: Creando hotspot del teléfono",
+                    detail = "D2/7: Creando hotspot del teléfono",
                     lastError = null,
                 )
 
-            android.util.Log.i(
-                TAG,
-                state.detail,
-            )
-
+            android.util.Log.i(TAG, state.detail)
             onState(state)
 
             val credentials =
@@ -363,13 +306,9 @@ class TuneBudsMediaSync(
 
             /*
              * D3
-             *
-             * Android successfully created the
-             * hotspot.
-             *
+             * Android successfully created the hotspot.
              * Never display/log the password.
              */
-
             state =
                 state.copy(
                     detail =
@@ -388,34 +327,22 @@ class TuneBudsMediaSync(
 
             /*
              * D4
-             *
-             * Send the hotspot credentials to
-             * the glasses and request file-manager
-             * mode through AB Mate.
+             * Send hotspot credentials and request file-manager mode.
              */
-
             state =
                 state.copy(
-                    detail =
-                        "D4/7: Conectando gafas al hotspot",
+                    detail = "D4/7: Conectando gafas al hotspot",
                     lastError = null,
                 )
 
-            android.util.Log.i(
-                TAG,
-                state.detail,
-            )
-
+            android.util.Log.i(TAG, state.detail)
             onState(state)
 
             val endpoint =
                 manager.startFileManager(
-                    hotspotSsid =
-                        credentials.ssid,
-                    hotspotPassword =
-                        credentials.password,
-                    channel =
-                        credentials.channel,
+                    hotspotSsid = credentials.ssid,
+                    hotspotPassword = credentials.password,
+                    channel = credentials.channel,
                 )
                     ?: throw IOException(
                         "TuneBuds did not report its media server address",
@@ -423,36 +350,25 @@ class TuneBudsMediaSync(
 
             /*
              * D5
-             *
-             * Glasses announced their HTTP
-             * media-server endpoint.
+             * Glasses announced their HTTP media-server endpoint.
              */
-
             state =
                 state.copy(
-                    detail =
-                        "D5/7: Servidor recibido: $endpoint",
+                    detail = "D5/7: Servidor recibido: $endpoint",
                     lastError = null,
                 )
 
-            android.util.Log.i(
-                TAG,
-                state.detail,
-            )
-
+            android.util.Log.i(TAG, state.detail)
             onState(state)
 
             val baseUrl =
-                normalizeBaseUrl(
-                    endpoint,
-                )
+                normalizeBaseUrl(endpoint)
 
             /*
              * D6
-             *
-             * Try media.config.
+             * Read media.config exactly once and preserve its raw body
+             * for E1749 diagnostics before parsing it.
              */
-
             state =
                 state.copy(
                     detail =
@@ -460,67 +376,85 @@ class TuneBudsMediaSync(
                     lastError = null,
                 )
 
-            android.util.Log.i(
-                TAG,
-                state.detail,
-            )
-
+            android.util.Log.i(TAG, state.detail)
             onState(state)
 
-            val items =
-                fetchManifest(
-                    baseUrl,
+            val manifestBody =
+                withContext(Dispatchers.IO) {
+                    getText(
+                        normalizeBaseUrl(baseUrl) +
+                            "media.config",
+                    )
+                }
+
+            val rawPreviewForLog =
+                manifestPreview(
+                    manifestBody,
+                    RAW_PREVIEW_LOG_LIMIT,
                 )
+
+            android.util.Log.i(
+                TAG,
+                "E1749 media.config RAW " +
+                    "length=${manifestBody.length}: " +
+                    rawPreviewForLog,
+            )
+
+            val items =
+                parseManifest(manifestBody)
 
             /*
              * D7
-             *
-             * Manifest was successfully retrieved
-             * and parsed.
+             * Manifest was retrieved and parsed.
              */
-
             state =
                 state.copy(
-                    total =
-                        items.size,
+                    total = items.size,
                     detail =
                         "D7/7: Manifest recibido: ${items.size} archivo(s)",
                     lastError = null,
                 )
 
-            android.util.Log.i(
-                TAG,
-                state.detail,
-            )
-
+            android.util.Log.i(TAG, state.detail)
             onState(state)
 
-            if (
-                items.isEmpty()
-            ) {
+            if (items.isEmpty()) {
+                val rawPreviewForUi =
+                    manifestPreview(
+                        manifestBody,
+                        RAW_PREVIEW_UI_LIMIT,
+                    )
+
+                val diagnostic =
+                    "media.config RAW " +
+                        "(${manifestBody.length} chars): " +
+                        rawPreviewForUi
+
+                android.util.Log.w(
+                    TAG,
+                    "E1749 $diagnostic",
+                )
+
                 state =
                     state.copy(
                         detail =
-                            "D7/7: media.config no contiene archivos compatibles",
+                            "D7/7: media.config sin archivos compatibles",
+                        lastError = diagnostic,
                     )
-
-                android.util.Log.i(
-                    TAG,
-                    state.detail,
-                )
 
                 onState(state)
 
-                return Result.success(
-                    0,
-                )
+                /*
+                 * Diagnostic build:
+                 * fail intentionally when the parser finds zero items
+                 * so MainActivity's final Toast shows the raw response.
+                 */
+                throw IOException(diagnostic)
             }
 
             var completed = 0
 
-            for (
-                item in items
-            ) {
+            for (item in items) {
                 coroutineContext.ensureActive()
 
                 state =
@@ -530,11 +464,7 @@ class TuneBudsMediaSync(
                         lastError = null,
                     )
 
-                android.util.Log.i(
-                    TAG,
-                    state.detail,
-                )
-
+                android.util.Log.i(TAG, state.detail)
                 onState(state)
 
                 val file =
@@ -546,17 +476,12 @@ class TuneBudsMediaSync(
 
                 val imported =
                     try {
-                        onFile(
-                            item,
-                            file,
-                        )
+                        onFile(item, file)
                     } finally {
                         file.delete()
                     }
 
-                if (
-                    !imported
-                ) {
+                if (!imported) {
                     throw IOException(
                         "Could not import ${item.fileName}",
                     )
@@ -566,48 +491,29 @@ class TuneBudsMediaSync(
 
                 state =
                     state.copy(
-                        completed =
-                            completed,
+                        completed = completed,
                         detail =
                             "Importado $completed/${items.size}",
                         lastError = null,
                     )
 
-                android.util.Log.i(
-                    TAG,
-                    state.detail,
-                )
-
+                android.util.Log.i(TAG, state.detail)
                 onState(state)
             }
 
             state =
                 state.copy(
-                    detail =
-                        "Sincronización completada",
+                    detail = "Sincronización completada",
                     lastError = null,
                 )
 
-            android.util.Log.i(
-                TAG,
-                state.detail,
-            )
-
+            android.util.Log.i(TAG, state.detail)
             onState(state)
 
-            return Result.success(
-                completed,
-            )
-
-        } catch (
-            error: CancellationException
-        ) {
+            return Result.success(completed)
+        } catch (error: CancellationException) {
             throw error
-
-        } catch (
-            error: Throwable
-        ) {
-
+        } catch (error: Throwable) {
             val failedAt =
                 state.detail
 
@@ -623,43 +529,28 @@ class TuneBudsMediaSync(
 
             state =
                 state.copy(
-                    detail =
-                        "FALLO en $failedAt",
-                    lastError =
-                        message,
+                    detail = "FALLO en $failedAt",
+                    lastError = message,
                 )
 
             onState(state)
 
-            return Result.failure(
-                error,
-            )
-
+            return Result.failure(error)
         } finally {
-
             withContext(
                 kotlinx.coroutines.NonCancellable,
             ) {
                 try {
-
                     manager.finishTransferBlocking()
-
-                } catch (
-                    error: Exception
-                ) {
-
+                } catch (error: Exception) {
                     android.util.Log.w(
                         TAG,
                         "Camera cleanup failed",
                         error,
                     )
-
                 } finally {
-
                     hotspot.stop()
-
-                    temporaryDirectory
-                        .deleteRecursively()
+                    temporaryDirectory.deleteRecursively()
                 }
             }
         }
@@ -668,14 +559,10 @@ class TuneBudsMediaSync(
     suspend fun fetchManifest(
         baseUrl: String,
     ): List<TuneBudsMediaItem> =
-        withContext(
-            Dispatchers.IO,
-        ) {
+        withContext(Dispatchers.IO) {
             parseManifest(
                 getText(
-                    normalizeBaseUrl(
-                        baseUrl,
-                    ) +
+                    normalizeBaseUrl(baseUrl) +
                         "media.config",
                 ),
             )
@@ -686,46 +573,29 @@ class TuneBudsMediaSync(
         item: TuneBudsMediaItem,
     ): File =
         download(
-            normalizeBaseUrl(
-                baseUrl,
-            ),
+            normalizeBaseUrl(baseUrl),
             item,
         ) { _, _, _ -> }
 
     fun parseManifest(
         body: String,
     ): List<TuneBudsMediaItem> {
-
         val trimmed =
             body.trim()
 
         val names =
             runCatching {
-
                 when {
-
-                    trimmed.startsWith(
-                        "[",
-                    ) -> {
-
+                    trimmed.startsWith("[") -> {
                         stringsFromArray(
-                            JSONArray(
-                                trimmed,
-                            ),
+                            JSONArray(trimmed),
                         )
                     }
 
-                    trimmed.startsWith(
-                        "{",
-                    ) -> {
-
+                    trimmed.startsWith("{") -> {
                         stringsFromArray(
-                            JSONObject(
-                                trimmed,
-                            )
-                                .optJSONArray(
-                                    "files",
-                                )
+                            JSONObject(trimmed)
+                                .optJSONArray("files")
                                 ?: JSONArray(),
                         )
                     }
@@ -733,34 +603,22 @@ class TuneBudsMediaSync(
                     else ->
                         emptyList()
                 }
-
             }
-                .getOrDefault(
-                    emptyList(),
-                )
+                .getOrDefault(emptyList())
                 .ifEmpty {
-
                     trimmed
                         .lineSequence()
-                        .map(
-                            String::trim,
-                        )
+                        .map(String::trim)
                         .filter {
                             it.isNotBlank() &&
-                                !it.startsWith(
-                                    "HTTP/",
-                                ) &&
-                                !it.contains(
-                                    ": ",
-                                )
+                                !it.startsWith("HTTP/") &&
+                                !it.contains(": ")
                         }
                         .toList()
                 }
 
         return names
-            .mapNotNull(
-                ::mediaItem,
-            )
+            .mapNotNull(::mediaItem)
             .distinctBy {
                 it.remoteName
             }
@@ -776,10 +634,7 @@ class TuneBudsMediaSync(
                 Long,
             ) -> Unit,
     ): File =
-        withContext(
-            Dispatchers.IO,
-        ) {
-
+        withContext(Dispatchers.IO) {
             val output =
                 File(
                     temporaryDirectory,
@@ -793,23 +648,16 @@ class TuneBudsMediaSync(
                 Request.Builder()
                     .url(
                         baseUrl +
-                            encodePath(
-                                item.remoteName,
-                            ),
+                            encodePath(item.remoteName),
                     )
                     .get()
                     .build()
 
             CLIENT
-                .newCall(
-                    request,
-                )
+                .newCall(request)
                 .execute()
                 .use { response ->
-
-                    if (
-                        !response.isSuccessful
-                    ) {
+                    if (!response.isSuccessful) {
                         throw IOException(
                             "TuneBuds HTTP ${response.code} for ${item.fileName}",
                         )
@@ -830,32 +678,20 @@ class TuneBudsMediaSync(
                     body
                         .byteStream()
                         .use { input ->
-
                             output
                                 .outputStream()
-                                .buffered(
-                                    128 * 1024,
-                                )
+                                .buffered(128 * 1024)
                                 .use { target ->
-
                                     val buffer =
-                                        ByteArray(
-                                            128 * 1024,
-                                        )
+                                        ByteArray(128 * 1024)
 
-                                    while (
-                                        true
-                                    ) {
+                                    while (true) {
                                         coroutineContext.ensureActive()
 
                                         val count =
-                                            input.read(
-                                                buffer,
-                                            )
+                                            input.read(buffer)
 
-                                        if (
-                                            count <= 0
-                                        ) {
+                                        if (count <= 0) {
                                             break
                                         }
 
@@ -865,8 +701,7 @@ class TuneBudsMediaSync(
                                             count,
                                         )
 
-                                        copied +=
-                                            count
+                                        copied += count
 
                                         onProgress(
                                             item,
@@ -884,7 +719,6 @@ class TuneBudsMediaSync(
     private fun getText(
         url: String,
     ): String {
-
         android.util.Log.i(
             TAG,
             "HTTP GET $url",
@@ -892,9 +726,7 @@ class TuneBudsMediaSync(
 
         val request =
             Request.Builder()
-                .url(
-                    url,
-                )
+                .url(url)
                 .header(
                     "Connection",
                     "close",
@@ -907,20 +739,15 @@ class TuneBudsMediaSync(
                 .build()
 
         CLIENT
-            .newCall(
-                request,
-            )
+            .newCall(request)
             .execute()
             .use { response ->
-
                 android.util.Log.i(
                     TAG,
                     "media.config HTTP response=${response.code}",
                 )
 
-                if (
-                    !response.isSuccessful
-                ) {
+                if (!response.isSuccessful) {
                     throw IOException(
                         "TuneBuds HTTP ${response.code} for media.config",
                     )
@@ -935,40 +762,63 @@ class TuneBudsMediaSync(
             }
     }
 
+    private fun manifestPreview(
+        body: String,
+        limit: Int,
+    ): String {
+        if (body.isEmpty()) {
+            return "<VACÍO>"
+        }
+
+        val escaped =
+            buildString {
+                body.forEach { char ->
+                    when (char) {
+                        '\r' -> append("\\r")
+                        '\n' -> append("\\n")
+                        '\t' -> append("\\t")
+                        else -> {
+                            if (
+                                char.code in 0x20..0x7E ||
+                                char.code >= 0xA0
+                            ) {
+                                append(char)
+                            } else {
+                                append(
+                                    "\\u%04x".format(
+                                        char.code,
+                                    ),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+        return if (escaped.length <= limit) {
+            escaped
+        } else {
+            escaped.take(limit) + "…"
+        }
+    }
+
     private fun stringsFromArray(
         array: JSONArray,
     ): List<String> =
         buildList {
-
-            for (
-                index in
-                0 until array.length()
-            ) {
-
+            for (index in 0 until array.length()) {
                 when (
                     val value =
-                        array.opt(
-                            index,
-                        )
+                        array.opt(index)
                 ) {
-
                     is String ->
-                        add(
-                            value,
-                        )
+                        add(value)
 
                     is JSONObject -> {
-
                         value
-                            .optString(
-                                "name",
-                            )
-                            .takeIf(
-                                String::isNotBlank,
-                            )
-                            ?.let(
-                                ::add,
-                            )
+                            .optString("name")
+                            .takeIf(String::isNotBlank)
+                            ?.let(::add)
                     }
                 }
             }
@@ -977,68 +827,40 @@ class TuneBudsMediaSync(
     private fun mediaItem(
         value: String,
     ): TuneBudsMediaItem? {
-
         val remote =
             value
                 .trim()
-                .replace(
-                    '\\',
-                    '/',
-                )
-                .trimStart(
-                    '/',
-                )
+                .replace('\\', '/')
+                .trimStart('/')
 
         if (
             remote.isBlank() ||
-            remote.contains(
-                "../",
-            )
+            remote.contains("../")
         ) {
             return null
         }
 
         var fileName =
-            File(
-                remote,
-            ).name
+            File(remote).name
 
         val lower =
             fileName.lowercase()
 
         val type =
             when {
-
-                lower.endsWith(
-                    ".jpg",
-                ) ||
-                    lower.endsWith(
-                        ".jpeg",
-                    ) -> {
-
+                lower.endsWith(".jpg") ||
+                    lower.endsWith(".jpeg") -> {
                     TuneBudsMediaType.PHOTO
                 }
 
-                lower.endsWith(
-                    ".mp4",
-                ) ||
-                    lower.startsWith(
-                        "video-",
-                    ) -> {
-
+                lower.endsWith(".mp4") ||
+                    lower.startsWith("video-") -> {
                     TuneBudsMediaType.VIDEO
                 }
 
-                lower.endsWith(
-                    ".opus",
-                ) ||
-                    lower.endsWith(
-                        ".ogg",
-                    ) ||
-                    lower.endsWith(
-                        ".wav",
-                    ) -> {
-
+                lower.endsWith(".opus") ||
+                    lower.endsWith(".ogg") ||
+                    lower.endsWith(".wav") -> {
                     TuneBudsMediaType.AUDIO
                 }
 
@@ -1047,44 +869,33 @@ class TuneBudsMediaSync(
             }
 
         if (
-            type ==
-            TuneBudsMediaType.VIDEO &&
+            type == TuneBudsMediaType.VIDEO &&
             '.' !in fileName
         ) {
-            fileName +=
-                ".mp4"
+            fileName += ".mp4"
         }
 
         return TuneBudsMediaItem(
-            remote,
-            fileName,
-            type,
+            remoteName = remote,
+            fileName = fileName,
+            type = type,
         )
     }
 
     private fun normalizeBaseUrl(
         value: String,
     ): String {
-
         val trimmed =
             value.trim()
 
         require(
-            trimmed.startsWith(
-                "http://",
-            ) ||
-                trimmed.startsWith(
-                    "https://",
-                ),
+            trimmed.startsWith("http://") ||
+                trimmed.startsWith("https://"),
         ) {
             "TuneBuds returned an invalid media server address"
         }
 
-        return if (
-            trimmed.endsWith(
-                '/',
-            )
-        ) {
+        return if (trimmed.endsWith('/')) {
             trimmed
         } else {
             "$trimmed/"
@@ -1095,16 +906,9 @@ class TuneBudsMediaSync(
         path: String,
     ): String =
         path
-            .split(
-                '/',
-            )
-            .filter(
-                String::isNotBlank,
-            )
-            .joinToString(
-                "/",
-            ) { segment ->
-
+            .split('/')
+            .filter(String::isNotBlank)
+            .joinToString("/") { segment ->
                 URLEncoder
                     .encode(
                         segment,
