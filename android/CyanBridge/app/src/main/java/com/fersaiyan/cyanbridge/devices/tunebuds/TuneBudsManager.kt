@@ -74,6 +74,8 @@ class TuneBudsManager private constructor(context: Context) {
         private const val CAMERA_CLOSE_MAX_ATTEMPTS = 15
         private const val FILE_MANAGER_RETRY_MS = 1_000L
         private const val FILE_MANAGER_MAX_ATTEMPTS = 30
+        private const val CMD_PHOTO_COMPLETE = 0xF3
+        private const val PHOTO_COMPLETE_TIMEOUT_MS = 15_000L
 
         @Volatile
         private var instance: TuneBudsManager? = null
@@ -207,15 +209,45 @@ class TuneBudsManager private constructor(context: Context) {
 
     fun takePhoto() =
         launchCommand("take photo") {
-            takePhotoBlocking()
+            coroutineScope {
+                val completion =
+                    async(start = CoroutineStart.UNDISPATCHED) {
+                        withTimeout(PHOTO_COMPLETE_TIMEOUT_MS) {
+                            client.frames
+                                .filter {
+                                    it.type == TuneBudsFrameType.NOTIFICATION &&
+                                        it.command == CMD_PHOTO_COMPLETE
+                                }
+                                .first()
+                        }
+                    }
 
-            delay(500L)
+                try {
+                    requireSuccess(
+                        request(
+                            TuneBudsProtocol.CMD_CAMERA_ON,
+                            byteArrayOf(0),
+                        ),
+                    )
 
-            requireSuccess(
-                request(
-                    TuneBudsProtocol.CMD_MEDIA_COUNTS,
-                ),
-            )
+                    completion.await()
+
+                    Log.i(
+                        TAG,
+                        "E1749: photo completion notification received",
+                    )
+
+                    delay(500L)
+
+                    requireSuccess(
+                        request(
+                            TuneBudsProtocol.CMD_MEDIA_COUNTS,
+                        ),
+                    )
+                } finally {
+                    completion.cancel()
+                }
+            }
         }
 
     suspend fun takePhotoBlocking() {
@@ -1110,6 +1142,19 @@ class TuneBudsManager private constructor(context: Context) {
                                         null,
                                 )
                         }
+                }
+            }
+
+            CMD_PHOTO_COMPLETE -> {
+
+                if (
+                    frame.type ==
+                    TuneBudsFrameType.NOTIFICATION
+                ) {
+                    Log.i(
+                        TAG,
+                        "E1749: received photo completion notification (0xF3), bytes=${frame.payload.size}",
+                    )
                 }
             }
 
