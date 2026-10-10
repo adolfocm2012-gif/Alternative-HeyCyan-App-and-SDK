@@ -232,7 +232,7 @@ class TuneBudsMediaSync(
     ): Result<Int> {
         var state =
             TuneBudsMediaSyncState(
-                detail = "D1/7: Finalizando cámara",
+                detail = "D1/7: Preparando sincronización",
             )
 
         android.util.Log.i(TAG, state.detail)
@@ -242,51 +242,23 @@ class TuneBudsMediaSync(
 
         try {
             /*
-             * D1
-             * Close the camera subsystem before asking
-             * the glasses to expose files.
+             * E1749 firmware 0.1.0.7:
+             *
+             * Do NOT send CAMERA_CLOSE (0xE2) here.
+             *
+             * On this hardware the media is already finalized after
+             * stopping video/audio. Sending an additional close command
+             * immediately before file-manager mode may disturb the
+             * firmware's media index.
              */
-            val cleanupResult =
-                runCatching {
-                    manager.finishTransferBlocking()
-                }
-
-            if (cleanupResult.isSuccess) {
-                state =
-                    state.copy(
-                        detail = "D1/7: Cámara preparada",
-                        lastError = null,
-                    )
-
-                android.util.Log.i(TAG, state.detail)
-                onState(state)
-            } else {
-                val message =
-                    cleanupResult
-                        .exceptionOrNull()
-                        ?.message
-                        ?: "unknown camera cleanup error"
-
-                android.util.Log.w(
-                    TAG,
-                    "D1 camera cleanup warning: $message",
-                    cleanupResult.exceptionOrNull(),
+            state =
+                state.copy(
+                    detail = "D1/7: Sin cierre extra de cámara",
+                    lastError = null,
                 )
 
-                state =
-                    state.copy(
-                        detail = "D1/7: Aviso al cerrar cámara",
-                        lastError = message,
-                    )
-
-                onState(state)
-
-                /*
-                 * Do not abort here.
-                 * Some firmware answers oddly to CAMERA_CLOSE
-                 * even when media is already safely stored.
-                 */
-            }
+            android.util.Log.i(TAG, state.detail)
+            onState(state)
 
             /*
              * D2
@@ -537,21 +509,17 @@ class TuneBudsMediaSync(
 
             return Result.failure(error)
         } finally {
+            /*
+             * E1749 firmware 0.1.0.7:
+             *
+             * Do NOT send CAMERA_CLOSE (0xE2) after the transfer either.
+             * Only tear down the phone hotspot and temporary local files.
+             */
             withContext(
                 kotlinx.coroutines.NonCancellable,
             ) {
-                try {
-                    manager.finishTransferBlocking()
-                } catch (error: Exception) {
-                    android.util.Log.w(
-                        TAG,
-                        "Camera cleanup failed",
-                        error,
-                    )
-                } finally {
-                    hotspot.stop()
-                    temporaryDirectory.deleteRecursively()
-                }
+                hotspot.stop()
+                temporaryDirectory.deleteRecursively()
             }
         }
     }
