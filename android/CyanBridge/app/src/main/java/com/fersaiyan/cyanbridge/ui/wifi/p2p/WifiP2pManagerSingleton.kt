@@ -42,6 +42,7 @@ class WifiP2pManagerSingleton private constructor(private val context: Context) 
     private val wifiP2pManager: WifiP2pManager = context.getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
     private var wifiP2pChannel: WifiP2pManager.Channel? = null
     private var wifiP2pDevice: WifiP2pDevice? = null
+    private var lastGroupOwnerIntent: Int? = null
     private val handler = Handler(Looper.getMainLooper())
     private val callbacks = CopyOnWriteArrayList<WifiP2pCallback>()
 
@@ -174,22 +175,33 @@ class WifiP2pManagerSingleton private constructor(private val context: Context) 
     }
 
     @SuppressLint("MissingPermission")
-    fun connectToDevice(device: WifiP2pDevice) {
+    fun connectToDevice(
+        device: WifiP2pDevice,
+        groupOwnerIntent: Int? = null,
+    ) {
         if (!p2pOperationsEnabled) {
             Log.d(TAG, "Ignoring P2P connect while operations are stopped")
             return
         }
+
         if (!hasWifiP2pPermission()) {
             Log.w(TAG, "Cannot connect P2P: required permission is not granted")
-            callbacks.forEach { it.onConnectRequestFailed(WifiP2pManager.ERROR) }
+            callbacks.forEach {
+                it.onConnectRequestFailed(
+                    WifiP2pManager.ERROR,
+                )
+            }
             return
         }
+
         // Once we decide to connect, stop peer discovery timeout tracking.
         resetPeerDiscovery()
 
         if (connectionState.isConnecting()) {
             Log.d(TAG, "P2P is connecting, no connection call back")
-            callbacks.forEach { it.connecting() }
+            callbacks.forEach {
+                it.connecting()
+            }
             return
         }
 
@@ -199,30 +211,85 @@ class WifiP2pManagerSingleton private constructor(private val context: Context) 
         }
 
         // Arm internal connect timeout (vendor app uses ~5s).
-        handler.postDelayed(connectTimeOut, connectTimeoutMs)
+        handler.postDelayed(
+            connectTimeOut,
+            connectTimeoutMs,
+        )
 
-        wifiP2pDevice = device
-        val config = WifiP2pConfig().apply {
-            deviceAddress = device.deviceAddress
-            // Match decompiled vendor app: WPS PBC.
-            wps.setup = 0
-        }
+        wifiP2pDevice =
+            device
 
-        connectionState.setConnecting(true)
-        Log.d(TAG, "Already connecting device: ${device.deviceName}---${device.deviceAddress}")
+        lastGroupOwnerIntent =
+            groupOwnerIntent
+                ?.coerceIn(
+                    0,
+                    15,
+                )
 
-        wifiP2pManager.connect(wifiP2pChannel, config, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() {
-                Log.d(TAG, "Connect request sent successfully")
-                callbacks.forEach { it.onConnectRequestSent() }
+        val config =
+            WifiP2pConfig().apply {
+                deviceAddress =
+                    device.deviceAddress
+
+                // Match decompiled vendor app: WPS PBC.
+                wps.setup =
+                    0
+
+                lastGroupOwnerIntent
+                    ?.let { intent ->
+                        this.groupOwnerIntent =
+                            intent
+                    }
             }
 
-            override fun onFailure(reason: Int) {
-                Log.e(TAG, "Connect request failed: $reason")
-                connectionState.markConnectRequestFailed()
-                callbacks.forEach { it.onConnectRequestFailed(reason) }
-            }
-        })
+        connectionState.setConnecting(
+            true,
+        )
+
+        Log.d(
+            TAG,
+            "Already connecting device: " +
+                "${device.deviceName}---${device.deviceAddress}, " +
+                "groupOwnerIntent=${lastGroupOwnerIntent ?: "default"}",
+        )
+
+        wifiP2pManager.connect(
+            wifiP2pChannel,
+            config,
+            object :
+                WifiP2pManager.ActionListener {
+
+                override fun onSuccess() {
+                    Log.d(
+                        TAG,
+                        "Connect request sent successfully",
+                    )
+
+                    callbacks.forEach {
+                        it.onConnectRequestSent()
+                    }
+                }
+
+                override fun onFailure(
+                    reason:
+                        Int,
+                ) {
+                    Log.e(
+                        TAG,
+                        "Connect request failed: $reason",
+                    )
+
+                    connectionState
+                        .markConnectRequestFailed()
+
+                    callbacks.forEach {
+                        it.onConnectRequestFailed(
+                            reason,
+                        )
+                    }
+                }
+            },
+        )
     }
 
     @SuppressLint("MissingPermission")
@@ -454,7 +521,11 @@ class WifiP2pManagerSingleton private constructor(private val context: Context) 
             if (retryState.shouldRetryConnect()) {
                 wifiP2pDevice?.let { device ->
                     Log.d(TAG, "Internal connection retry connection once")
-                    connectToDevice(device)
+                    connectToDevice(
+                        device,
+                        groupOwnerIntent =
+                            lastGroupOwnerIntent,
+                    )
                 }
             } else {
                 Log.d(TAG, "Do not reconnect, wait for external timeout")
