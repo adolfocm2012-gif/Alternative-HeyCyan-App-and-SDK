@@ -2,37 +2,55 @@ package com.fersaiyan.cyanbridge.devices.tunebuds
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.wifi.SoftApConfiguration
 import android.net.wifi.WifiManager
+import android.net.wifi.p2p.WifiP2pDevice
+import android.net.wifi.p2p.WifiP2pInfo
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import com.fersaiyan.cyanbridge.ui.hasWifiP2pPermission
+import com.fersaiyan.cyanbridge.ui.wifi.p2p.WifiP2pManagerSingleton
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
-import okhttp3.OkHttpClient
-import okhttp3.Request
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
+import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.NetworkInterface
 import java.net.Socket
 import java.net.URL
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
-import java.util.concurrent.TimeUnit
+import java.util.Collections
 import kotlin.coroutines.coroutineContext
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.random.Random
 
 data class TuneBudsHotspotCredentials(
     val ssid: String,
@@ -40,12 +58,19 @@ data class TuneBudsHotspotCredentials(
     val channel: Int = 0,
 )
 
+/**
+ * Kept for compatibility with MainActivity and as a future fallback path.
+ * Build #24 uses Wi-Fi Direct for the primary TuneBuds media transfer.
+ */
 class TuneBudsLocalHotspot(context: Context) {
     companion object {
         private const val START_TIMEOUT_MS = 30_000L
     }
 
     private val context = context.applicationContext
+
+    internal val appContext: Context
+        get() = context
 
     private val wifiManager =
         context.getSystemService(Context.WIFI_SERVICE) as WifiManager
@@ -95,12 +120,11 @@ class TuneBudsLocalHotspot(context: Context) {
                             if (credentials == null) {
                                 stop()
 
-                                continuation
-                                    .resumeWithException(
-                                        IOException(
-                                            "Android returned empty hotspot credentials",
-                                        ),
-                                    )
+                                continuation.resumeWithException(
+                                    IOException(
+                                        "Android returned empty hotspot credentials",
+                                    ),
+                                )
                             } else {
                                 continuation.resume(
                                     credentials,
@@ -112,12 +136,11 @@ class TuneBudsLocalHotspot(context: Context) {
                             reservation = null
 
                             if (continuation.isActive) {
-                                continuation
-                                    .resumeWithException(
-                                        IOException(
-                                            "Local hotspot stopped before it was ready",
-                                        ),
-                                    )
+                                continuation.resumeWithException(
+                                    IOException(
+                                        "Local hotspot stopped before it was ready",
+                                    ),
+                                )
                             }
                         }
 
@@ -127,12 +150,11 @@ class TuneBudsLocalHotspot(context: Context) {
                             reservation = null
 
                             if (continuation.isActive) {
-                                continuation
-                                    .resumeWithException(
-                                        IOException(
-                                            "Could not start local hotspot: $reason",
-                                        ),
-                                    )
+                                continuation.resumeWithException(
+                                    IOException(
+                                        "Could not start local hotspot: $reason",
+                                    ),
+                                )
                             }
                         }
                     },
@@ -245,6 +267,17 @@ private data class RawHttpDownloadResult(
     val readError: IOException?,
 )
 
+/**
+ * TuneBuds / AB Mate media synchronization.
+ *
+ * E1749 build #24:
+ * - Uses the vendor-preferred Wi-Fi Direct topology (E6 mode 2).
+ * - Matches the glasses peer using the F2 peer MAC or generated AiGlassDb SSID.
+ * - Keeps the E7 endpoint authoritative.
+ * - Routes HTTP sockets through the P2P network/interface.
+ * - Never sends EB, so device media is not deleted.
+ * - Never sends an extra E2 around synchronization.
+ */
 class TuneBudsMediaSync(
     private val manager: TuneBudsManager,
     private val hotspot: TuneBudsLocalHotspot,
@@ -272,23 +305,37 @@ class TuneBudsMediaSync(
         private const val RAW_HTTP_READ_TIMEOUT_MS =
             120_000
 
-        private val CLIENT =
-            OkHttpClient
-                .Builder()
-                .connectTimeout(
-                    20,
-                    TimeUnit.SECONDS,
-                )
-                .readTimeout(
-                    120,
-                    TimeUnit.SECONDS,
-                )
-                .writeTimeout(
-                    30,
-                    TimeUnit.SECONDS,
-                )
-                .build()
+        private const val P2P_CONNECT_TIMEOUT_MS =
+            45_000L
+
+        private const val P2P_NETWORK_WAIT_MS =
+            10_000L
+
+        private const val P2P_CLEANUP_TIMEOUT_MS =
+            4_000L
     }
+
+    private val appContext:
+        Context =
+        hotspot.appContext
+
+    private val connectivityManager:
+        ConnectivityManager =
+        appContext.getSystemService(
+            Context.CONNECTIVITY_SERVICE,
+        ) as ConnectivityManager
+
+    @Volatile
+    private var p2pNetwork:
+        Network? = null
+
+    @Volatile
+    private var p2pManager:
+        WifiP2pManagerSingleton? = null
+
+    @Volatile
+    private var p2pCallback:
+        WifiP2pManagerSingleton.WifiP2pCallback? = null
 
     suspend fun sync(
         onState:
@@ -311,10 +358,10 @@ class TuneBudsMediaSync(
         var state =
             TuneBudsMediaSyncState(
                 detail =
-                    "D1/7: Preparando sincronización",
+                    "D1/7: Preparando sincronización P2P",
             )
 
-        android.util.Log.i(
+        Log.i(
             TAG,
             state.detail,
         )
@@ -334,7 +381,7 @@ class TuneBudsMediaSync(
                         null,
                 )
 
-            android.util.Log.i(
+            Log.i(
                 TAG,
                 state.detail,
             )
@@ -346,12 +393,12 @@ class TuneBudsMediaSync(
             state =
                 state.copy(
                     detail =
-                        "D2/7: Creando hotspot del teléfono",
+                        "D2/7: Preparando Wi-Fi Direct",
                     lastError =
                         null,
                 )
 
-            android.util.Log.i(
+            Log.i(
                 TAG,
                 state.detail,
             )
@@ -360,37 +407,18 @@ class TuneBudsMediaSync(
                 state,
             )
 
-            val credentials =
-                hotspot.start()
+            val connection =
+                establishP2pFileManager()
 
             state =
                 state.copy(
                     detail =
-                        "D3/7: Hotspot creado (${credentials.ssid})",
+                        "D3/7: P2P conectado (${connection.peerAddress})",
                     lastError =
                         null,
                 )
 
-            android.util.Log.i(
-                TAG,
-                "D3 hotspot created: " +
-                    "SSID=${credentials.ssid}, " +
-                    "channel=${credentials.channel}",
-            )
-
-            onState(
-                state,
-            )
-
-            state =
-                state.copy(
-                    detail =
-                        "D4/7: Conectando gafas al hotspot",
-                    lastError =
-                        null,
-                )
-
-            android.util.Log.i(
+            Log.i(
                 TAG,
                 state.detail,
             )
@@ -400,28 +428,17 @@ class TuneBudsMediaSync(
             )
 
             val endpoint =
-                manager
-                    .startFileManager(
-                        hotspotSsid =
-                            credentials.ssid,
-                        hotspotPassword =
-                            credentials.password,
-                        channel =
-                            credentials.channel,
-                    )
-                    ?: throw IOException(
-                        "TuneBuds did not report its media server address",
-                    )
+                connection.endpoint
 
             state =
                 state.copy(
                     detail =
-                        "D5/7: Servidor recibido: $endpoint",
+                        "D4/7: Servidor P2P recibido: $endpoint",
                     lastError =
                         null,
                 )
 
-            android.util.Log.i(
+            Log.i(
                 TAG,
                 state.detail,
             )
@@ -438,12 +455,12 @@ class TuneBudsMediaSync(
             state =
                 state.copy(
                     detail =
-                        "D6/7: Leyendo ${baseUrl}media.config",
+                        "D5/7: Leyendo ${baseUrl}media.config",
                     lastError =
                         null,
                 )
 
-            android.util.Log.i(
+            Log.i(
                 TAG,
                 state.detail,
             )
@@ -456,7 +473,7 @@ class TuneBudsMediaSync(
                 withContext(
                     Dispatchers.IO,
                 ) {
-                    getText(
+                    rawHttpGetText(
                         normalizeBaseUrl(
                             baseUrl,
                         ) +
@@ -470,9 +487,9 @@ class TuneBudsMediaSync(
                     RAW_PREVIEW_LOG_LIMIT,
                 )
 
-            android.util.Log.i(
+            Log.i(
                 TAG,
-                "E1749 media.config RAW " +
+                "E1749 P2P media.config RAW " +
                     "length=${manifestBody.length}: " +
                     rawPreviewForLog,
             )
@@ -487,12 +504,12 @@ class TuneBudsMediaSync(
                     total =
                         items.size,
                     detail =
-                        "D7/7: Manifest recibido: ${items.size} archivo(s)",
+                        "D6/7: Manifest recibido: ${items.size} archivo(s)",
                     lastError =
                         null,
                 )
 
-            android.util.Log.i(
+            Log.i(
                 TAG,
                 state.detail,
             )
@@ -513,7 +530,7 @@ class TuneBudsMediaSync(
                         "(${manifestBody.length} chars): " +
                         rawPreviewForUi
 
-                android.util.Log.w(
+                Log.w(
                     TAG,
                     "E1749 $diagnostic",
                 )
@@ -521,7 +538,7 @@ class TuneBudsMediaSync(
                 state =
                     state.copy(
                         detail =
-                            "D7/7: media.config sin archivos compatibles",
+                            "D6/7: media.config sin archivos compatibles",
                         lastError =
                             diagnostic,
                     )
@@ -545,12 +562,12 @@ class TuneBudsMediaSync(
                 state =
                     state.copy(
                         detail =
-                            "Descargando ${completed + 1}/${items.size}: ${item.fileName}",
+                            "D7/7: Descargando ${completed + 1}/${items.size}: ${item.fileName}",
                         lastError =
                             null,
                     )
 
-                android.util.Log.i(
+                Log.i(
                     TAG,
                     state.detail,
                 )
@@ -594,7 +611,7 @@ class TuneBudsMediaSync(
                             null,
                     )
 
-                android.util.Log.i(
+                Log.i(
                     TAG,
                     state.detail,
                 )
@@ -607,12 +624,12 @@ class TuneBudsMediaSync(
             state =
                 state.copy(
                     detail =
-                        "Sincronización completada",
+                        "Sincronización P2P completada",
                     lastError =
                         null,
                 )
 
-            android.util.Log.i(
+            Log.i(
                 TAG,
                 state.detail,
             )
@@ -640,9 +657,9 @@ class TuneBudsMediaSync(
                 error.message
                     ?: error.javaClass.simpleName
 
-            android.util.Log.e(
+            Log.e(
                 TAG,
-                "E1749 sync failed at [$failedAt]: $message",
+                "E1749 P2P sync failed at [$failedAt]: $message",
                 error,
             )
 
@@ -663,8 +680,10 @@ class TuneBudsMediaSync(
             )
         } finally {
             withContext(
-                kotlinx.coroutines.NonCancellable,
+                NonCancellable,
             ) {
+                cleanupP2p()
+
                 hotspot.stop()
 
                 temporaryDirectory
@@ -673,14 +692,681 @@ class TuneBudsMediaSync(
         }
     }
 
+    /**
+     * Starts E6 mode 2 / E7 over SPP and Android Wi-Fi Direct discovery in parallel.
+     * The TuneBuds manager supplies the authoritative F2 peer MAC and E7 endpoint.
+     */
+    private suspend fun establishP2pFileManager():
+        TuneBudsP2pFileManagerInfo =
+        coroutineScope {
+
+            val wifi =
+                WifiP2pManagerSingleton
+                    .getInstance(
+                        appContext,
+                    )
+
+            if (!wifi.canUseP2p()) {
+                throw SecurityException(
+                    "Nearby Wi-Fi permission is required for TuneBuds P2P sync",
+                )
+            }
+
+            p2pManager =
+                wifi
+
+            val p2pSsid =
+                "AiGlassDb_${
+                    Random.nextInt(
+                        0,
+                        10_000,
+                    )
+                }"
+
+            val connected =
+                CompletableDeferred<
+                    WifiP2pInfo
+                >()
+
+            var lastPeers:
+                Collection<
+                    WifiP2pDevice
+                > =
+                emptyList()
+
+            fun choosePeer(
+                peers:
+                    Collection<
+                        WifiP2pDevice
+                    >,
+            ): WifiP2pDevice? {
+
+                val reportedMac =
+                    normalizeMac(
+                        manager
+                            .state
+                            .value
+                            .p2pPeerAddress,
+                    )
+
+                val byMac =
+                    if (
+                        reportedMac.isNotBlank()
+                    ) {
+                        peers.firstOrNull {
+                            normalizeMac(
+                                it.deviceAddress,
+                            ) ==
+                                reportedMac
+                        }
+                    } else {
+                        null
+                    }
+
+                if (byMac != null) {
+                    return byMac
+                }
+
+                return peers.firstOrNull {
+                    val name =
+                        it.deviceName
+                            ?.trim()
+                            .orEmpty()
+
+                    name.equals(
+                        p2pSsid,
+                        ignoreCase = true,
+                    ) ||
+                        name.contains(
+                            p2pSsid,
+                            ignoreCase = true,
+                        )
+                }
+            }
+
+            fun tryConnect(
+                peers:
+                    Collection<
+                        WifiP2pDevice
+                    >,
+            ) {
+                if (
+                    connected.isCompleted ||
+                    wifi.isConnecting() ||
+                    wifi.isConnected()
+                ) {
+                    return
+                }
+
+                val target =
+                    choosePeer(
+                        peers,
+                    )
+                        ?: return
+
+                Log.i(
+                    TAG,
+                    "E1749 P2P target: " +
+                        "${target.deviceName}/${target.deviceAddress}, " +
+                        "reported=${manager.state.value.p2pPeerAddress}",
+                )
+
+                /*
+                 * The shared P2P wrapper uses WPS PBC.
+                 * A dedicated GO-intent overload can be added later if this firmware
+                 * proves to require the phone to be group owner.
+                 */
+                wifi.connectToDevice(
+                    target,
+                )
+            }
+
+            val callback =
+                object :
+                    WifiP2pManagerSingleton
+                    .WifiP2pCallback {
+
+                    override fun onWifiP2pEnabled() {
+                        Log.i(
+                            TAG,
+                            "Android Wi-Fi Direct enabled",
+                        )
+                    }
+
+                    override fun onWifiP2pDisabled() {
+                        if (
+                            !connected.isCompleted
+                        ) {
+                            connected.completeExceptionally(
+                                IOException(
+                                    "Android Wi-Fi Direct is disabled",
+                                ),
+                            )
+                        }
+                    }
+
+                    override fun onPeersChanged(
+                        peers:
+                            Collection<
+                                WifiP2pDevice
+                            >,
+                    ) {
+                        lastPeers =
+                            peers.toList()
+
+                        Log.i(
+                            TAG,
+                            "E1749 P2P peers=" +
+                                peers.joinToString {
+                                    "${it.deviceName}/${it.deviceAddress}"
+                                },
+                        )
+
+                        tryConnect(
+                            peers,
+                        )
+                    }
+
+                    override fun onThisDeviceChanged(
+                        device:
+                            WifiP2pDevice,
+                    ) {
+                        Log.d(
+                            TAG,
+                            "P2P local device: " +
+                                "${device.deviceName}/${device.deviceAddress}",
+                        )
+                    }
+
+                    override fun onConnected(
+                        info:
+                            WifiP2pInfo,
+                    ) {
+                        if (
+                            info.groupFormed &&
+                            !connected.isCompleted
+                        ) {
+                            Log.i(
+                                TAG,
+                                "E1749 P2P group formed; " +
+                                    "phoneIsOwner=${info.isGroupOwner}, " +
+                                    "owner=${info.groupOwnerAddress?.hostAddress}",
+                            )
+
+                            connected.complete(
+                                info,
+                            )
+                        }
+                    }
+
+                    override fun onDisconnected() {
+                        Log.i(
+                            TAG,
+                            "E1749 P2P disconnected",
+                        )
+                    }
+
+                    override fun onPeerDiscoveryStarted() {
+                        Log.i(
+                            TAG,
+                            "E1749 P2P discovery started",
+                        )
+                    }
+
+                    override fun onPeerDiscoveryFailed(
+                        reason:
+                            Int,
+                    ) {
+                        Log.w(
+                            TAG,
+                            "E1749 P2P discovery failed: $reason",
+                        )
+                    }
+
+                    override fun onConnectRequestSent() {
+                        Log.i(
+                            TAG,
+                            "E1749 P2P connect request accepted",
+                        )
+                    }
+
+                    override fun onConnectRequestFailed(
+                        reason:
+                            Int,
+                    ) {
+                        Log.w(
+                            TAG,
+                            "E1749 P2P connect request failed: $reason",
+                        )
+                    }
+
+                    override fun connecting() {
+                        Log.d(
+                            TAG,
+                            "E1749 P2P already connecting",
+                        )
+                    }
+
+                    override fun cancelConnect() {
+                        Log.d(
+                            TAG,
+                            "E1749 P2P connect cancelled",
+                        )
+                    }
+
+                    override fun cancelConnectFail(
+                        reason:
+                            Int,
+                    ) {
+                        Log.w(
+                            TAG,
+                            "E1749 P2P cancel failed: $reason",
+                        )
+                    }
+
+                    override fun retryAlsoFailed() {
+                        if (
+                            !connected.isCompleted
+                        ) {
+                            connected.completeExceptionally(
+                                IOException(
+                                    "Wi-Fi Direct could not connect to the TuneBuds peer",
+                                ),
+                            )
+                        }
+                    }
+                }
+
+            p2pCallback =
+                callback
+
+            wifi.resetFailCount()
+            wifi.registerReceiver()
+            wifi.addCallback(
+                callback,
+            )
+
+            val handshake =
+                async {
+                    manager
+                        .startFileManagerP2p(
+                            p2pSsid =
+                                p2pSsid,
+                            timeoutMs =
+                                P2P_CONNECT_TIMEOUT_MS,
+                        )
+                        ?: throw IOException(
+                            "TuneBuds did not start its P2P file manager",
+                        )
+                }
+
+            val peerWatcher =
+                launch {
+                    val peer =
+                        manager
+                            .state
+                            .filter {
+                                !it.p2pPeerAddress
+                                    .isNullOrBlank()
+                            }
+                            .first()
+                            .p2pPeerAddress
+
+                    Log.i(
+                        TAG,
+                        "E1749 F2 peer available: $peer",
+                    )
+
+                    /*
+                     * A peer list may have arrived before F2. Re-evaluate it
+                     * immediately, then ask Android for a fresh list.
+                     */
+                    tryConnect(
+                        lastPeers,
+                    )
+
+                    repeat(
+                        4,
+                    ) {
+                        if (
+                            connected.isCompleted
+                        ) {
+                            return@launch
+                        }
+
+                        wifi.requestPeers()
+
+                        delay(
+                            1_250L,
+                        )
+                    }
+                }
+
+            try {
+                /*
+                 * Start Android discovery after the E6/E7 coroutine is armed.
+                 * Device resets on the shared wrapper's discovery timeout are
+                 * disabled because TuneBuds uses its own SPP protocol.
+                 */
+                wifi.startPeerDiscovery(
+                    allowDeviceResetOnTimeout =
+                        false,
+                )
+
+                val info =
+                    withTimeout(
+                        P2P_CONNECT_TIMEOUT_MS,
+                    ) {
+                        connected.await()
+                    }
+
+                p2pNetwork =
+                    waitForP2pNetwork(
+                        P2P_NETWORK_WAIT_MS,
+                    )
+
+                val localAddress =
+                    p2pLocalIpv4Address()
+
+                Log.i(
+                    TAG,
+                    "E1749 P2P routing: " +
+                        "network=${describeNetwork(p2pNetwork)}, " +
+                        "local=${localAddress?.hostAddress}, " +
+                        "groupOwner=${info.groupOwnerAddress?.hostAddress}",
+                )
+
+                if (
+                    p2pNetwork == null &&
+                    localAddress == null
+                ) {
+                    Log.w(
+                        TAG,
+                        "Android did not expose a dedicated P2P Network/interface; " +
+                            "system routing will be used as final fallback",
+                    )
+                }
+
+                val fileManagerInfo =
+                    withTimeout(
+                        P2P_CONNECT_TIMEOUT_MS,
+                    ) {
+                        handshake.await()
+                    }
+
+                Log.i(
+                    TAG,
+                    "E1749 P2P file manager ready: " +
+                        "peer=${fileManagerInfo.peerAddress}, " +
+                        "endpoint=${fileManagerInfo.endpoint}",
+                )
+
+                fileManagerInfo
+            } finally {
+                peerWatcher.cancel()
+
+                if (
+                    !handshake.isCompleted
+                ) {
+                    handshake.cancel()
+                }
+            }
+        }
+
+    private suspend fun waitForP2pNetwork(
+        timeoutMs:
+            Long,
+    ): Network? {
+
+        val deadline =
+            System.currentTimeMillis() +
+                timeoutMs
+
+        while (
+            System.currentTimeMillis() <
+            deadline
+        ) {
+            findP2pNetwork()
+                ?.let {
+                    return it
+                }
+
+            delay(
+                250L,
+            )
+        }
+
+        return findP2pNetwork()
+    }
+
+    private fun findP2pNetwork():
+        Network? {
+
+        return runCatching {
+            connectivityManager
+                .allNetworks
+                .firstOrNull { network ->
+
+                    val capabilities =
+                        connectivityManager
+                            .getNetworkCapabilities(
+                                network,
+                            )
+                            ?: return@firstOrNull false
+
+                    if (
+                        !capabilities.hasTransport(
+                            NetworkCapabilities.TRANSPORT_WIFI,
+                        ) ||
+                        capabilities.hasTransport(
+                            NetworkCapabilities.TRANSPORT_VPN,
+                        )
+                    ) {
+                        return@firstOrNull false
+                    }
+
+                    val properties =
+                        connectivityManager
+                            .getLinkProperties(
+                                network,
+                            )
+
+                    val interfaceName =
+                        properties
+                            ?.interfaceName
+                            .orEmpty()
+
+                    val addresses =
+                        properties
+                            ?.linkAddresses
+                            ?.mapNotNull {
+                                it.address
+                                    .hostAddress
+                            }
+                            .orEmpty()
+
+                    interfaceName.contains(
+                        "p2p",
+                        ignoreCase = true,
+                    ) ||
+                        interfaceName.contains(
+                            "wfd",
+                            ignoreCase = true,
+                        ) ||
+                        addresses.any {
+                            it.startsWith(
+                                "192.168.49.",
+                            )
+                        }
+                }
+        }
+            .getOrNull()
+    }
+
+    private fun p2pLocalIpv4Address():
+        InetAddress? {
+
+        return runCatching {
+            Collections
+                .list(
+                    NetworkInterface
+                        .getNetworkInterfaces(),
+                )
+                .asSequence()
+                .filter { networkInterface ->
+                    val name =
+                        networkInterface
+                            .name
+                            .orEmpty()
+
+                    name.contains(
+                        "p2p",
+                        ignoreCase = true,
+                    ) ||
+                        name.contains(
+                            "wfd",
+                            ignoreCase = true,
+                        )
+                }
+                .flatMap { networkInterface ->
+                    Collections
+                        .list(
+                            networkInterface
+                                .inetAddresses,
+                        )
+                        .asSequence()
+                }
+                .firstOrNull { address ->
+                    address is Inet4Address &&
+                        !address.isLoopbackAddress
+                }
+        }
+            .getOrNull()
+    }
+
+    private fun describeNetwork(
+        network:
+            Network?,
+    ): String {
+
+        if (
+            network == null
+        ) {
+            return "none"
+        }
+
+        return runCatching {
+            val properties =
+                connectivityManager
+                    .getLinkProperties(
+                        network,
+                    )
+
+            "if=${properties?.interfaceName}, " +
+                "addresses=" +
+                properties
+                    ?.linkAddresses
+                    ?.joinToString {
+                        it.address.hostAddress
+                            .orEmpty()
+                    }
+        }
+            .getOrDefault(
+                network.toString(),
+            )
+    }
+
+    private fun normalizeMac(
+        value:
+            String?,
+    ): String =
+        value
+            .orEmpty()
+            .filter {
+                it.isLetterOrDigit()
+            }
+            .uppercase()
+
+    private suspend fun cleanupP2p() {
+        val wifi =
+            p2pManager
+
+        val callback =
+            p2pCallback
+
+        p2pCallback =
+            null
+
+        p2pNetwork =
+            null
+
+        p2pManager =
+            null
+
+        if (
+            wifi == null
+        ) {
+            return
+        }
+
+        if (
+            callback != null
+        ) {
+            runCatching {
+                wifi.removeCallback(
+                    callback,
+                )
+            }
+        }
+
+        runCatching {
+            wifi.stopP2pOperations()
+        }
+
+        runCatching {
+            wifi.cancelP2pConnection()
+        }
+
+        withTimeoutOrNull(
+            P2P_CLEANUP_TIMEOUT_MS,
+        ) {
+            suspendCancellableCoroutine<Unit> { continuation ->
+                runCatching {
+                    wifi.removeGroup { _ ->
+                        if (
+                            continuation.isActive
+                        ) {
+                            continuation.resume(
+                                Unit,
+                            )
+                        }
+                    }
+                }.onFailure {
+                    if (
+                        continuation.isActive
+                    ) {
+                        continuation.resume(
+                            Unit,
+                        )
+                    }
+                }
+            }
+        }
+
+        runCatching {
+            wifi.unregisterReceiver()
+        }
+    }
+
     suspend fun fetchManifest(
-        baseUrl: String,
+        baseUrl:
+            String,
     ): List<TuneBudsMediaItem> =
         withContext(
             Dispatchers.IO,
         ) {
             parseManifest(
-                getText(
+                rawHttpGetText(
                     normalizeBaseUrl(
                         baseUrl,
                     ) +
@@ -690,8 +1376,10 @@ class TuneBudsMediaSync(
         }
 
     suspend fun downloadSingle(
-        baseUrl: String,
-        item: TuneBudsMediaItem,
+        baseUrl:
+            String,
+        item:
+            TuneBudsMediaItem,
     ): File =
         download(
             normalizeBaseUrl(
@@ -701,7 +1389,8 @@ class TuneBudsMediaSync(
         ) { _, _, _ -> }
 
     fun parseManifest(
-        body: String,
+        body:
+            String,
     ): List<TuneBudsMediaItem> {
 
         val trimmed =
@@ -769,8 +1458,10 @@ class TuneBudsMediaSync(
     }
 
     private suspend fun download(
-        baseUrl: String,
-        item: TuneBudsMediaItem,
+        baseUrl:
+            String,
+        item:
+            TuneBudsMediaItem,
         onProgress:
             suspend (
                 TuneBudsMediaItem,
@@ -787,7 +1478,6 @@ class TuneBudsMediaSync(
                     item.fileName,
                 ).apply {
                     parentFile?.mkdirs()
-
                     delete()
                 }
 
@@ -815,9 +1505,9 @@ class TuneBudsMediaSync(
                 val attempt =
                     index + 1
 
-                android.util.Log.i(
+                Log.i(
                     TAG,
-                    "RAW HTTP media download " +
+                    "P2P RAW HTTP media download " +
                         "attempt $attempt/" +
                         "$MEDIA_DOWNLOAD_MAX_ATTEMPTS: " +
                         item.remoteName,
@@ -841,9 +1531,9 @@ class TuneBudsMediaSync(
                         lastFailure =
                             result.readError
 
-                        android.util.Log.w(
+                        Log.w(
                             TAG,
-                            "RAW HTTP stream closed with error " +
+                            "P2P RAW HTTP stream closed with error " +
                                 "after ${result.copied} bytes: " +
                                 result.readError.message,
                         )
@@ -855,18 +1545,18 @@ class TuneBudsMediaSync(
                             output,
                         )
 
-                    android.util.Log.i(
+                    Log.i(
                         TAG,
-                        "RAW HTTP received=${output.length()}, " +
+                        "P2P RAW HTTP received=${output.length()}, " +
                             "advertised=${result.advertisedLength}, " +
                             "valid=$valid, " +
                             "file=${item.fileName}",
                     )
 
                     if (valid) {
-                        android.util.Log.i(
+                        Log.i(
                             TAG,
-                            "Media accepted after RAW HTTP: " +
+                            "Media accepted after P2P RAW HTTP: " +
                                 "${output.length()} bytes",
                         )
 
@@ -893,9 +1583,9 @@ class TuneBudsMediaSync(
                     lastFailure =
                         error
 
-                    android.util.Log.w(
+                    Log.w(
                         TAG,
-                        "RAW HTTP attempt $attempt failed: " +
+                        "P2P RAW HTTP attempt $attempt failed: " +
                             (error.message
                                 ?: error.javaClass.simpleName),
                         error,
@@ -913,7 +1603,7 @@ class TuneBudsMediaSync(
             }
 
             throw IOException(
-                "TuneBuds RAW media download failed " +
+                "TuneBuds P2P RAW media download failed " +
                     "after $MEDIA_DOWNLOAD_MAX_ATTEMPTS attempts; " +
                     "last=${output.length()} bytes, " +
                     "advertised=" +
@@ -929,9 +1619,12 @@ class TuneBudsMediaSync(
         }
 
     private suspend fun rawHttpDownload(
-        urlString: String,
-        output: File,
-        item: TuneBudsMediaItem,
+        urlString:
+            String,
+        output:
+            File,
+        item:
+            TuneBudsMediaItem,
         onProgress:
             suspend (
                 TuneBudsMediaItem,
@@ -945,102 +1638,38 @@ class TuneBudsMediaSync(
                 urlString,
             )
 
-        if (
-            !url.protocol.equals(
-                "http",
-                ignoreCase = true,
-            )
-        ) {
-            throw IOException(
-                "RAW TuneBuds transfer only supports HTTP",
-            )
-        }
+        validateHttpUrl(
+            url,
+        )
 
         val port =
-            if (
-                url.port > 0
-            ) {
-                url.port
-            } else {
-                80
-            }
-
-        val path =
-            if (
-                url.file.isNullOrBlank()
-            ) {
-                "/"
-            } else {
-                url.file
-            }
-
-        val socket =
-            Socket()
-
-        try {
-            socket.soTimeout =
-                RAW_HTTP_READ_TIMEOUT_MS
-
-            socket.connect(
-                InetSocketAddress(
-                    url.host,
-                    port,
-                ),
-                RAW_HTTP_CONNECT_TIMEOUT_MS,
+            effectivePort(
+                url,
             )
 
+        val path =
+            requestPath(
+                url,
+            )
+
+        val socket =
+            createRoutedSocket(
+                url.host,
+                port,
+            )
+
+        try {
             val networkOutput =
                 BufferedOutputStream(
                     socket.getOutputStream(),
                 )
 
-            val hostHeader =
-                if (
-                    port == 80
-                ) {
-                    url.host
-                } else {
-                    "${url.host}:$port"
-                }
-
-            val request =
-                buildString {
-                    append(
-                        "GET $path HTTP/1.1\r\n",
-                    )
-
-                    append(
-                        "Host: $hostHeader\r\n",
-                    )
-
-                    append(
-                        "User-Agent: TSClient/1.0\r\n",
-                    )
-
-                    append(
-                        "Connection: close\r\n",
-                    )
-
-                    append(
-                        "Accept: */*\r\n",
-                    )
-
-                    append(
-                        "Accept-Encoding: identity\r\n",
-                    )
-
-                    append(
-                        "\r\n",
-                    )
-                }
-
-            networkOutput.write(
-                request.toByteArray(
-                    StandardCharsets.US_ASCII,
-                ),
+            sendHttpGet(
+                networkOutput,
+                url,
+                port,
+                path,
             )
-
-            networkOutput.flush()
 
             val input =
                 BufferedInputStream(
@@ -1048,85 +1677,21 @@ class TuneBudsMediaSync(
                     128 * 1024,
                 )
 
-            val statusLine =
-                readHttpLine(
+            val response =
+                readHttpResponseHead(
                     input,
+                    item.fileName,
                 )
-                    ?: throw IOException(
-                        "TuneBuds returned no HTTP status",
-                    )
 
-            val statusCode =
-                statusLine
-                    .split(
-                        ' ',
-                    )
-                    .getOrNull(
-                        1,
-                    )
-                    ?.toIntOrNull()
-                    ?: throw IOException(
-                        "Invalid TuneBuds HTTP status: $statusLine",
-                    )
-
-            if (
-                statusCode !in 200..299
-            ) {
-                throw IOException(
-                    "TuneBuds HTTP $statusCode for ${item.fileName}",
-                )
-            }
-
-            val headers =
-                mutableMapOf<
-                    String,
-                    String,
-                >()
-
-            while (true) {
-                val line =
-                    readHttpLine(
-                        input,
-                    )
-                        ?: break
-
-                if (
-                    line.isEmpty()
-                ) {
-                    break
-                }
-
-                val separator =
-                    line.indexOf(
-                        ':',
-                    )
-
-                if (
-                    separator > 0
-                ) {
-                    val name =
-                        line
-                            .substring(
-                                0,
-                                separator,
-                            )
-                            .trim()
-                            .lowercase()
-
-                    val value =
-                        line
-                            .substring(
-                                separator + 1,
-                            )
-                            .trim()
-
-                    headers[name] =
-                        value
-                }
-            }
+            val advertisedLength =
+                response.second[
+                    "content-length"
+                ]
+                    ?.toLongOrNull()
+                    ?: -1L
 
             val transferEncoding =
-                headers[
+                response.second[
                     "transfer-encoding"
                 ]
 
@@ -1138,22 +1703,15 @@ class TuneBudsMediaSync(
                     ) == true
             ) {
                 throw IOException(
-                    "TuneBuds returned chunked HTTP, unsupported in RAW diagnostic",
+                    "TuneBuds returned chunked HTTP, unsupported for media transfer",
                 )
             }
 
-            val advertisedLength =
-                headers[
-                    "content-length"
-                ]
-                    ?.toLongOrNull()
-                    ?: -1L
-
-            android.util.Log.i(
+            Log.i(
                 TAG,
-                "RAW HTTP response=$statusCode, " +
+                "P2P RAW HTTP response=${response.first}, " +
                     "contentLength=$advertisedLength, " +
-                    "connection=${headers["connection"]}, " +
+                    "connection=${response.second["connection"]}, " +
                     "file=${item.fileName}",
             )
 
@@ -1190,7 +1748,6 @@ class TuneBudsMediaSync(
                             ) {
                                 readError =
                                     error
-
                                 break
                             }
 
@@ -1240,15 +1797,532 @@ class TuneBudsMediaSync(
         }
     }
 
+    private fun rawHttpGetText(
+        urlString:
+            String,
+    ): String {
+
+        val url =
+            URL(
+                urlString,
+            )
+
+        validateHttpUrl(
+            url,
+        )
+
+        val port =
+            effectivePort(
+                url,
+            )
+
+        val socket =
+            createRoutedSocket(
+                url.host,
+                port,
+            )
+
+        try {
+            val output =
+                BufferedOutputStream(
+                    socket.getOutputStream(),
+                )
+
+            sendHttpGet(
+                output,
+                url,
+                port,
+                requestPath(
+                    url,
+                ),
+            )
+
+            val input =
+                BufferedInputStream(
+                    socket.getInputStream(),
+                    32 * 1024,
+                )
+
+            val response =
+                readHttpResponseHead(
+                    input,
+                    "media.config",
+                )
+
+            val transferEncoding =
+                response.second[
+                    "transfer-encoding"
+                ]
+
+            if (
+                transferEncoding
+                    ?.contains(
+                        "chunked",
+                        ignoreCase = true,
+                    ) == true
+            ) {
+                return readChunkedText(
+                    input,
+                )
+            }
+
+            val expected =
+                response.second[
+                    "content-length"
+                ]
+                    ?.toIntOrNull()
+
+            val bytes =
+                ByteArrayOutputStream()
+
+            val buffer =
+                ByteArray(
+                    16 * 1024,
+                )
+
+            while (true) {
+                val count =
+                    input.read(
+                        buffer,
+                    )
+
+                if (
+                    count < 0
+                ) {
+                    break
+                }
+
+                if (
+                    count > 0
+                ) {
+                    bytes.write(
+                        buffer,
+                        0,
+                        count,
+                    )
+
+                    if (
+                        expected != null &&
+                        bytes.size() >=
+                        expected
+                    ) {
+                        break
+                    }
+                }
+            }
+
+            val result =
+                bytes
+                    .toByteArray()
+
+            val finalBytes =
+                if (
+                    expected != null &&
+                    expected >= 0 &&
+                    result.size >
+                    expected
+                ) {
+                    result.copyOf(
+                        expected,
+                    )
+                } else {
+                    result
+                }
+
+            return String(
+                finalBytes,
+                StandardCharsets.UTF_8,
+            )
+        } finally {
+            runCatching {
+                socket.close()
+            }
+        }
+    }
+
+    private fun createRoutedSocket(
+        host:
+            String,
+        port:
+            Int,
+    ): Socket {
+
+        val socket =
+            try {
+                p2pNetwork
+                    ?.socketFactory
+                    ?.createSocket()
+            } catch (
+                error:
+                    Throwable,
+            ) {
+                Log.w(
+                    TAG,
+                    "P2P Network socketFactory failed: ${error.message}",
+                )
+                null
+            }
+                ?: Socket()
+
+        socket.soTimeout =
+            RAW_HTTP_READ_TIMEOUT_MS
+
+        if (
+            p2pNetwork == null
+        ) {
+            p2pLocalIpv4Address()
+                ?.let { local ->
+                    runCatching {
+                        socket.bind(
+                            InetSocketAddress(
+                                local,
+                                0,
+                            ),
+                        )
+                    }.onFailure {
+                        Log.w(
+                            TAG,
+                            "Could not bind HTTP socket to P2P local address " +
+                                "${local.hostAddress}: ${it.message}",
+                        )
+                    }
+                }
+        }
+
+        socket.connect(
+            InetSocketAddress(
+                host,
+                port,
+            ),
+            RAW_HTTP_CONNECT_TIMEOUT_MS,
+        )
+
+        return socket
+    }
+
+    private fun validateHttpUrl(
+        url:
+            URL,
+    ) {
+        if (
+            !url.protocol.equals(
+                "http",
+                ignoreCase = true,
+            )
+        ) {
+            throw IOException(
+                "TuneBuds transfer only supports HTTP",
+            )
+        }
+
+        if (
+            url.host.isBlank()
+        ) {
+            throw IOException(
+                "TuneBuds returned an invalid HTTP endpoint",
+            )
+        }
+    }
+
+    private fun effectivePort(
+        url:
+            URL,
+    ): Int =
+        if (
+            url.port >
+            0
+        ) {
+            url.port
+        } else {
+            /*
+             * The legacy TuneBuds transfer client defaults to 8080
+             * when E7 omits an explicit port.
+             */
+            8080
+        }
+
+    private fun requestPath(
+        url:
+            URL,
+    ): String =
+        if (
+            url.file.isNullOrBlank()
+        ) {
+            "/"
+        } else {
+            url.file
+        }
+
+    private fun sendHttpGet(
+        output:
+            BufferedOutputStream,
+        url:
+            URL,
+        port:
+            Int,
+        path:
+            String,
+    ) {
+        val hostHeader =
+            if (
+                port ==
+                80
+            ) {
+                url.host
+            } else {
+                "${url.host}:$port"
+            }
+
+        val request =
+            buildString {
+                append(
+                    "GET $path HTTP/1.1\r\n",
+                )
+
+                append(
+                    "Host: $hostHeader\r\n",
+                )
+
+                append(
+                    "User-Agent: TSClient/1.0\r\n",
+                )
+
+                append(
+                    "Connection: close\r\n",
+                )
+
+                append(
+                    "Accept: */*\r\n",
+                )
+
+                append(
+                    "Accept-Encoding: identity\r\n",
+                )
+
+                append(
+                    "\r\n",
+                )
+            }
+
+        output.write(
+            request.toByteArray(
+                StandardCharsets.US_ASCII,
+            ),
+        )
+
+        output.flush()
+    }
+
+    private fun readHttpResponseHead(
+        input:
+            BufferedInputStream,
+        resource:
+            String,
+    ): Pair<
+        Int,
+        Map<
+            String,
+            String
+        >
+    > {
+        val statusLine =
+            readHttpLine(
+                input,
+            )
+                ?: throw IOException(
+                    "TuneBuds returned no HTTP status for $resource",
+                )
+
+        val statusCode =
+            statusLine
+                .split(
+                    ' ',
+                )
+                .getOrNull(
+                    1,
+                )
+                ?.toIntOrNull()
+                ?: throw IOException(
+                    "Invalid TuneBuds HTTP status: $statusLine",
+                )
+
+        if (
+            statusCode !in
+            200..299
+        ) {
+            throw IOException(
+                "TuneBuds HTTP $statusCode for $resource",
+            )
+        }
+
+        val headers =
+            mutableMapOf<
+                String,
+                String
+            >()
+
+        while (true) {
+            val line =
+                readHttpLine(
+                    input,
+                )
+                    ?: break
+
+            if (
+                line.isEmpty()
+            ) {
+                break
+            }
+
+            val separator =
+                line.indexOf(
+                    ':',
+                )
+
+            if (
+                separator >
+                0
+            ) {
+                val name =
+                    line
+                        .substring(
+                            0,
+                            separator,
+                        )
+                        .trim()
+                        .lowercase()
+
+                val value =
+                    line
+                        .substring(
+                            separator + 1,
+                        )
+                        .trim()
+
+                headers[
+                    name
+                ] =
+                    value
+            }
+        }
+
+        return statusCode to
+            headers
+    }
+
+    private fun readChunkedText(
+        input:
+            BufferedInputStream,
+    ): String {
+
+        val bytes =
+            ByteArrayOutputStream()
+
+        while (true) {
+            val sizeLine =
+                readHttpLine(
+                    input,
+                )
+                    ?: throw IOException(
+                        "Unexpected EOF in chunked media.config",
+                    )
+
+            val size =
+                sizeLine
+                    .substringBefore(
+                        ';',
+                    )
+                    .trim()
+                    .toIntOrNull(
+                        16,
+                    )
+                    ?: throw IOException(
+                        "Invalid HTTP chunk size: $sizeLine",
+                    )
+
+            if (
+                size ==
+                0
+            ) {
+                while (true) {
+                    val trailer =
+                        readHttpLine(
+                            input,
+                        )
+                            ?: break
+
+                    if (
+                        trailer.isEmpty()
+                    ) {
+                        break
+                    }
+                }
+
+                break
+            }
+
+            var remaining =
+                size
+
+            val buffer =
+                ByteArray(
+                    minOf(
+                        16 * 1024,
+                        size,
+                    ),
+                )
+
+            while (
+                remaining >
+                0
+            ) {
+                val count =
+                    input.read(
+                        buffer,
+                        0,
+                        minOf(
+                            buffer.size,
+                            remaining,
+                        ),
+                    )
+
+                if (
+                    count <
+                    0
+                ) {
+                    throw IOException(
+                        "Unexpected EOF inside HTTP chunk",
+                    )
+                }
+
+                bytes.write(
+                    buffer,
+                    0,
+                    count,
+                )
+
+                remaining -=
+                    count
+            }
+
+            readHttpLine(
+                input,
+            )
+        }
+
+        return String(
+            bytes.toByteArray(),
+            StandardCharsets.UTF_8,
+        )
+    }
+
     private fun readHttpLine(
         input:
             BufferedInputStream,
     ): String? {
 
         val bytes =
-            mutableListOf<
-                Byte,
-            >()
+            ByteArrayOutputStream()
 
         var sawAnyByte =
             false
@@ -1258,7 +2332,8 @@ class TuneBudsMediaSync(
                 input.read()
 
             if (
-                value < 0
+                value <
+                0
             ) {
                 if (
                     !sawAnyByte
@@ -1273,21 +2348,23 @@ class TuneBudsMediaSync(
                 true
 
             if (
-                value == '\n'.code
+                value ==
+                '\n'.code
             ) {
                 break
             }
 
             if (
-                value != '\r'.code
+                value !=
+                '\r'.code
             ) {
-                bytes.add(
-                    value.toByte(),
+                bytes.write(
+                    value,
                 )
             }
 
             if (
-                bytes.size >
+                bytes.size() >
                 16 * 1024
             ) {
                 throw IOException(
@@ -1303,13 +2380,16 @@ class TuneBudsMediaSync(
     }
 
     private fun validateDownloadedMedia(
-        item: TuneBudsMediaItem,
-        file: File,
+        item:
+            TuneBudsMediaItem,
+        file:
+            File,
     ): Boolean {
 
         if (
             !file.exists() ||
-            file.length() <= 0L
+            file.length() <=
+            0L
         ) {
             return false
         }
@@ -1335,11 +2415,13 @@ class TuneBudsMediaSync(
     }
 
     private fun isCompleteMp4(
-        file: File,
+        file:
+            File,
     ): Boolean {
 
         if (
-            file.length() < 16L
+            file.length() <
+            16L
         ) {
             return false
         }
@@ -1370,7 +2452,8 @@ class TuneBudsMediaSync(
                     fileLength
                 ) {
                     if (
-                        fileLength - position <
+                        fileLength -
+                        position <
                         8L
                     ) {
                         return@use false
@@ -1429,7 +2512,8 @@ class TuneBudsMediaSync(
                                     raf.readLong()
 
                                 if (
-                                    extended <= 0L
+                                    extended <=
+                                    0L
                                 ) {
                                     return@use false
                                 }
@@ -1494,11 +2578,13 @@ class TuneBudsMediaSync(
     }
 
     private fun isCompleteJpeg(
-        file: File,
+        file:
+            File,
     ): Boolean {
 
         if (
-            file.length() < 4L
+            file.length() <
+            4L
         ) {
             return false
         }
@@ -1526,10 +2612,14 @@ class TuneBudsMediaSync(
                 val endB =
                     raf.readUnsignedByte()
 
-                startA == 0xFF &&
-                    startB == 0xD8 &&
-                    endA == 0xFF &&
-                    endB == 0xD9
+                startA ==
+                    0xFF &&
+                    startB ==
+                    0xD8 &&
+                    endA ==
+                    0xFF &&
+                    endB ==
+                    0xD9
             }
         }
             .getOrDefault(
@@ -1538,11 +2628,13 @@ class TuneBudsMediaSync(
     }
 
     private fun isPlausibleAudio(
-        file: File,
+        file:
+            File,
     ): Boolean {
 
         if (
-            file.length() < 12L
+            file.length() <
+            12L
         ) {
             return false
         }
@@ -1570,8 +2662,10 @@ class TuneBudsMediaSync(
                         StandardCharsets.ISO_8859_1,
                     )
 
-                prefix4 == "OggS" ||
-                    prefix4 == "RIFF"
+                prefix4 ==
+                    "OggS" ||
+                    prefix4 ==
+                    "RIFF"
             }
         }
             .getOrDefault(
@@ -1579,64 +2673,11 @@ class TuneBudsMediaSync(
             )
     }
 
-    private fun getText(
-        url: String,
-    ): String {
-
-        android.util.Log.i(
-            TAG,
-            "HTTP GET $url",
-        )
-
-        val request =
-            Request
-                .Builder()
-                .url(
-                    url,
-                )
-                .header(
-                    "Connection",
-                    "close",
-                )
-                .header(
-                    "User-Agent",
-                    "TSClient/1.0",
-                )
-                .get()
-                .build()
-
-        CLIENT
-            .newCall(
-                request,
-            )
-            .execute()
-            .use { response ->
-
-                android.util.Log.i(
-                    TAG,
-                    "media.config HTTP response=${response.code}",
-                )
-
-                if (
-                    !response.isSuccessful
-                ) {
-                    throw IOException(
-                        "TuneBuds HTTP ${response.code} for media.config",
-                    )
-                }
-
-                return response
-                    .body
-                    ?.string()
-                    ?: throw IOException(
-                        "TuneBuds returned an empty media.config",
-                    )
-            }
-    }
-
     private fun manifestPreview(
-        body: String,
-        limit: Int,
+        body:
+            String,
+        limit:
+            Int,
     ): String {
 
         if (
@@ -1697,12 +2738,14 @@ class TuneBudsMediaSync(
         } else {
             escaped.take(
                 limit,
-            ) + "…"
+            ) +
+                "…"
         }
     }
 
     private fun stringsFromArray(
-        array: JSONArray,
+        array:
+            JSONArray,
     ): List<String> =
         buildList {
             for (
@@ -1738,7 +2781,8 @@ class TuneBudsMediaSync(
         }
 
     private fun mediaItem(
-        value: String,
+        value:
+            String,
     ): TuneBudsMediaItem? {
 
         val remote =
@@ -1826,7 +2870,8 @@ class TuneBudsMediaSync(
     }
 
     private fun normalizeBaseUrl(
-        value: String,
+        value:
+            String,
     ): String {
 
         val trimmed =
@@ -1835,10 +2880,7 @@ class TuneBudsMediaSync(
         require(
             trimmed.startsWith(
                 "http://",
-            ) ||
-                trimmed.startsWith(
-                    "https://",
-                ),
+            )
         ) {
             "TuneBuds returned an invalid media server address"
         }
@@ -1855,7 +2897,8 @@ class TuneBudsMediaSync(
     }
 
     private fun encodePath(
-        path: String,
+        path:
+            String,
     ): String =
         path
             .split(
