@@ -5,8 +5,10 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.wifi.SoftApConfiguration
 import android.net.wifi.WifiManager
+import android.net.wifi.WifiNetworkSpecifier
 import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pInfo
 import android.os.Build
@@ -270,11 +272,11 @@ private data class RawHttpDownloadResult(
 /**
  * TuneBuds / AB Mate media synchronization.
  *
- * E1749 build #24:
- * - Uses the vendor-preferred Wi-Fi Direct topology (E6 mode 2).
- * - Matches the glasses peer using the F2 peer MAC or generated AiGlassDb SSID.
+ * E1749 build #25:
+ * - Diagnostic station fallback: E6 mode 1.
+ * - Requests a temporary glasses-created Wi-Fi network with a known SSID/passphrase.
  * - Keeps the E7 endpoint authoritative.
- * - Routes HTTP sockets through the P2P network/interface.
+ * - Routes HTTP sockets through the Android Network returned for that Wi-Fi.
  * - Never sends EB, so device media is not deleted.
  * - Never sends an extra E2 around synchronization.
  */
@@ -337,6 +339,10 @@ class TuneBudsMediaSync(
     private var p2pCallback:
         WifiP2pManagerSingleton.WifiP2pCallback? = null
 
+    @Volatile
+    private var stationNetworkCallback:
+        ConnectivityManager.NetworkCallback? = null
+
     suspend fun sync(
         onState:
             suspend (
@@ -393,7 +399,7 @@ class TuneBudsMediaSync(
             state =
                 state.copy(
                     detail =
-                        "D2/7: Preparando Wi-Fi Direct",
+                        "D2/7: Preparando Wi-Fi de las gafas (modo 1)",
                     lastError =
                         null,
                 )
@@ -408,12 +414,12 @@ class TuneBudsMediaSync(
             )
 
             val connection =
-                establishP2pFileManager()
+                establishStationFileManager()
 
             state =
                 state.copy(
                     detail =
-                        "D3/7: P2P conectado (${connection.peerAddress})",
+                        "D3/7: Wi-Fi de las gafas conectado",
                     lastError =
                         null,
                 )
@@ -433,7 +439,7 @@ class TuneBudsMediaSync(
             state =
                 state.copy(
                     detail =
-                        "D4/7: Servidor P2P recibido: $endpoint",
+                        "D4/7: Servidor Wi-Fi recibido: $endpoint",
                     lastError =
                         null,
                 )
@@ -624,7 +630,7 @@ class TuneBudsMediaSync(
             state =
                 state.copy(
                     detail =
-                        "Sincronización P2P completada",
+                        "Sincronización Wi-Fi modo 1 completada",
                     lastError =
                         null,
                 )
@@ -659,7 +665,7 @@ class TuneBudsMediaSync(
 
             Log.e(
                 TAG,
-                "E1749 P2P sync failed at [$failedAt]: $message",
+                "E1749 station sync failed at [$failedAt]: $message",
                 error,
             )
 
@@ -693,29 +699,30 @@ class TuneBudsMediaSync(
     }
 
     /**
-     * Starts E6 mode 2 / E7 over SPP and Android Wi-Fi Direct discovery in parallel.
-     * The TuneBuds manager supplies the authoritative F2 peer MAC and E7 endpoint.
+     * Build #25 diagnostic station path.
+     *
+     * TuneBudsManager.startFileManagerP2p() is temporarily switched to E6 mode 1
+     * for this build. The SSID passed here is therefore treated as the SSID the
+     * glasses should expose, with 12345678 as its WPA2 passphrase.
+     *
+     * Android's WifiNetworkSpecifier gives us a Network object for that local-only
+     * Wi-Fi. All HTTP sockets are created from that Network so mobile data / the
+     * normal Wi-Fi route cannot steal the media traffic.
      */
-    private suspend fun establishP2pFileManager():
+    private suspend fun establishStationFileManager():
         TuneBudsP2pFileManagerInfo =
         coroutineScope {
 
-            val wifi =
-                WifiP2pManagerSingleton
-                    .getInstance(
-                        appContext,
-                    )
-
-            if (!wifi.canUseP2p()) {
-                throw SecurityException(
-                    "Nearby Wi-Fi permission is required for TuneBuds P2P sync",
+            if (
+                Build.VERSION.SDK_INT <
+                Build.VERSION_CODES.Q
+            ) {
+                throw IOException(
+                    "TuneBuds station sync requires Android 10 or newer",
                 )
             }
 
-            p2pManager =
-                wifi
-
-            val p2pSsid =
+            val stationSsid =
                 "AiGlassDb_${
                     Random.nextInt(
                         0,
@@ -723,369 +730,143 @@ class TuneBudsMediaSync(
                     )
                 }"
 
-            val connected =
+            val stationPassword =
+                "12345678"
+
+            Log.i(
+                TAG,
+                "E1749 station diagnostic: requesting " +
+                    "ssid=$stationSsid, mode=1",
+            )
+
+            val networkReady =
                 CompletableDeferred<
-                    WifiP2pInfo
+                    Network
                 >()
 
-            var lastPeers:
-                Collection<
-                    WifiP2pDevice
-                > =
-                emptyList()
-
-            fun choosePeer(
-                peers:
-                    Collection<
-                        WifiP2pDevice
-                    >,
-            ): WifiP2pDevice? {
-
-                val reportedMac =
-                    normalizeMac(
-                        manager
-                            .state
-                            .value
-                            .p2pPeerAddress,
+            val specifier =
+                WifiNetworkSpecifier
+                    .Builder()
+                    .setSsid(
+                        stationSsid,
                     )
-
-                val byMac =
-                    if (
-                        reportedMac.isNotBlank()
-                    ) {
-                        peers.firstOrNull {
-                            normalizeMac(
-                                it.deviceAddress,
-                            ) ==
-                                reportedMac
-                        }
-                    } else {
-                        null
-                    }
-
-                if (byMac != null) {
-                    return byMac
-                }
-
-                return peers.firstOrNull {
-                    val name =
-                        it.deviceName
-                            ?.trim()
-                            .orEmpty()
-
-                    name.equals(
-                        p2pSsid,
-                        ignoreCase = true,
-                    ) ||
-                        name.contains(
-                            p2pSsid,
-                            ignoreCase = true,
-                        )
-                }
-            }
-
-            fun tryConnect(
-                peers:
-                    Collection<
-                        WifiP2pDevice
-                    >,
-            ) {
-                if (
-                    connected.isCompleted ||
-                    wifi.isConnecting() ||
-                    wifi.isConnected()
-                ) {
-                    return
-                }
-
-                val target =
-                    choosePeer(
-                        peers,
+                    .setWpa2Passphrase(
+                        stationPassword,
                     )
-                        ?: return
+                    .build()
 
-                Log.i(
-                    TAG,
-                    "E1749 P2P target: " +
-                        "${target.deviceName}/${target.deviceAddress}, " +
-                        "reported=${manager.state.value.p2pPeerAddress}",
-                )
-
-                /*
-                 * The shared P2P wrapper uses WPS PBC.
-                 * A dedicated GO-intent overload can be added later if this firmware
-                 * proves to require the phone to be group owner.
-                 */
-                wifi.connectToDevice(
-                    target,
-                )
-            }
+            val request =
+                NetworkRequest
+                    .Builder()
+                    .addTransportType(
+                        NetworkCapabilities.TRANSPORT_WIFI,
+                    )
+                    .removeCapability(
+                        NetworkCapabilities.NET_CAPABILITY_INTERNET,
+                    )
+                    .setNetworkSpecifier(
+                        specifier,
+                    )
+                    .build()
 
             val callback =
                 object :
-                    WifiP2pManagerSingleton
-                    .WifiP2pCallback {
+                    ConnectivityManager.NetworkCallback() {
 
-                    override fun onWifiP2pEnabled() {
+                    override fun onAvailable(
+                        network:
+                            Network,
+                    ) {
                         Log.i(
                             TAG,
-                            "Android Wi-Fi Direct enabled",
+                            "E1749 station Android network available: $network",
                         )
+
+                        p2pNetwork =
+                            network
+
+                        if (
+                            !networkReady.isCompleted
+                        ) {
+                            networkReady.complete(
+                                network,
+                            )
+                        }
                     }
 
-                    override fun onWifiP2pDisabled() {
+                    override fun onUnavailable() {
                         if (
-                            !connected.isCompleted
+                            !networkReady.isCompleted
                         ) {
-                            connected.completeExceptionally(
+                            networkReady.completeExceptionally(
                                 IOException(
-                                    "Android Wi-Fi Direct is disabled",
+                                    "Android could not connect to the TuneBuds Wi-Fi network $stationSsid",
                                 ),
                             )
                         }
                     }
 
-                    override fun onPeersChanged(
-                        peers:
-                            Collection<
-                                WifiP2pDevice
-                            >,
-                    ) {
-                        lastPeers =
-                            peers.toList()
-
-                        Log.i(
-                            TAG,
-                            "E1749 P2P peers=" +
-                                peers.joinToString {
-                                    "${it.deviceName}/${it.deviceAddress}"
-                                },
-                        )
-
-                        tryConnect(
-                            peers,
-                        )
-                    }
-
-                    override fun onThisDeviceChanged(
-                        device:
-                            WifiP2pDevice,
-                    ) {
-                        Log.d(
-                            TAG,
-                            "P2P local device: " +
-                                "${device.deviceName}/${device.deviceAddress}",
-                        )
-                    }
-
-                    override fun onConnected(
-                        info:
-                            WifiP2pInfo,
-                    ) {
-                        if (
-                            info.groupFormed &&
-                            !connected.isCompleted
-                        ) {
-                            Log.i(
-                                TAG,
-                                "E1749 P2P group formed; " +
-                                    "phoneIsOwner=${info.isGroupOwner}, " +
-                                    "owner=${info.groupOwnerAddress?.hostAddress}",
-                            )
-
-                            connected.complete(
-                                info,
-                            )
-                        }
-                    }
-
-                    override fun onDisconnected() {
-                        Log.i(
-                            TAG,
-                            "E1749 P2P disconnected",
-                        )
-                    }
-
-                    override fun onPeerDiscoveryStarted() {
-                        Log.i(
-                            TAG,
-                            "E1749 P2P discovery started",
-                        )
-                    }
-
-                    override fun onPeerDiscoveryFailed(
-                        reason:
-                            Int,
+                    override fun onLost(
+                        network:
+                            Network,
                     ) {
                         Log.w(
                             TAG,
-                            "E1749 P2P discovery failed: $reason",
+                            "E1749 station Android network lost: $network",
                         )
-                    }
-
-                    override fun onConnectRequestSent() {
-                        Log.i(
-                            TAG,
-                            "E1749 P2P connect request accepted",
-                        )
-                    }
-
-                    override fun onConnectRequestFailed(
-                        reason:
-                            Int,
-                    ) {
-                        Log.w(
-                            TAG,
-                            "E1749 P2P connect request failed: $reason",
-                        )
-                    }
-
-                    override fun connecting() {
-                        Log.d(
-                            TAG,
-                            "E1749 P2P already connecting",
-                        )
-                    }
-
-                    override fun cancelConnect() {
-                        Log.d(
-                            TAG,
-                            "E1749 P2P connect cancelled",
-                        )
-                    }
-
-                    override fun cancelConnectFail(
-                        reason:
-                            Int,
-                    ) {
-                        Log.w(
-                            TAG,
-                            "E1749 P2P cancel failed: $reason",
-                        )
-                    }
-
-                    override fun retryAlsoFailed() {
-                        if (
-                            !connected.isCompleted
-                        ) {
-                            connected.completeExceptionally(
-                                IOException(
-                                    "Wi-Fi Direct could not connect to the TuneBuds peer",
-                                ),
-                            )
-                        }
                     }
                 }
 
-            p2pCallback =
+            stationNetworkCallback =
                 callback
 
-            wifi.resetFailCount()
-            wifi.registerReceiver()
-            wifi.addCallback(
-                callback,
-            )
-
+            /*
+             * Arm both sides together:
+             * 1) Bluetooth asks the glasses for E6 mode 1 + E7.
+             * 2) Android waits for the exact SSID to appear and joins it.
+             *
+             * The system may show a Wi-Fi connection confirmation dialog.
+             */
             val handshake =
                 async {
                     manager
                         .startFileManagerP2p(
                             p2pSsid =
-                                p2pSsid,
+                                stationSsid,
                             timeoutMs =
                                 P2P_CONNECT_TIMEOUT_MS,
                         )
                         ?: throw IOException(
-                            "TuneBuds did not start its P2P file manager",
+                            "TuneBuds did not start its mode-1 file manager",
                         )
-                }
-
-            val peerWatcher =
-                launch {
-                    val peer =
-                        manager
-                            .state
-                            .filter {
-                                !it.p2pPeerAddress
-                                    .isNullOrBlank()
-                            }
-                            .first()
-                            .p2pPeerAddress
-
-                    Log.i(
-                        TAG,
-                        "E1749 F2 peer available: $peer",
-                    )
-
-                    /*
-                     * A peer list may have arrived before F2. Re-evaluate it
-                     * immediately, then ask Android for a fresh list.
-                     */
-                    tryConnect(
-                        lastPeers,
-                    )
-
-                    repeat(
-                        4,
-                    ) {
-                        if (
-                            connected.isCompleted
-                        ) {
-                            return@launch
-                        }
-
-                        wifi.requestPeers()
-
-                        delay(
-                            1_250L,
-                        )
-                    }
                 }
 
             try {
-                /*
-                 * Start Android discovery after the E6/E7 coroutine is armed.
-                 * Device resets on the shared wrapper's discovery timeout are
-                 * disabled because TuneBuds uses its own SPP protocol.
-                 */
-                wifi.startPeerDiscovery(
-                    allowDeviceResetOnTimeout =
-                        false,
-                )
+                connectivityManager
+                    .requestNetwork(
+                        request,
+                        callback,
+                        P2P_CONNECT_TIMEOUT_MS
+                            .toInt(),
+                    )
 
-                val info =
+                val network =
                     withTimeout(
                         P2P_CONNECT_TIMEOUT_MS,
                     ) {
-                        connected.await()
+                        networkReady.await()
                     }
 
                 p2pNetwork =
-                    waitForP2pNetwork(
-                        P2P_NETWORK_WAIT_MS,
-                    )
-
-                val localAddress =
-                    p2pLocalIpv4Address()
+                    network
 
                 Log.i(
                     TAG,
-                    "E1749 P2P routing: " +
-                        "network=${describeNetwork(p2pNetwork)}, " +
-                        "local=${localAddress?.hostAddress}, " +
-                        "groupOwner=${info.groupOwnerAddress?.hostAddress}",
+                    "E1749 station routing ready: " +
+                        describeNetwork(
+                            network,
+                        ),
                 )
-
-                if (
-                    p2pNetwork == null &&
-                    localAddress == null
-                ) {
-                    Log.w(
-                        TAG,
-                        "Android did not expose a dedicated P2P Network/interface; " +
-                            "system routing will be used as final fallback",
-                    )
-                }
 
                 val fileManagerInfo =
                     withTimeout(
@@ -1096,15 +877,12 @@ class TuneBudsMediaSync(
 
                 Log.i(
                     TAG,
-                    "E1749 P2P file manager ready: " +
-                        "peer=${fileManagerInfo.peerAddress}, " +
+                    "E1749 station file manager ready: " +
                         "endpoint=${fileManagerInfo.endpoint}",
                 )
 
                 fileManagerInfo
             } finally {
-                peerWatcher.cancel()
-
                 if (
                     !handshake.isCompleted
                 ) {
@@ -1288,6 +1066,19 @@ class TuneBudsMediaSync(
             .uppercase()
 
     private suspend fun cleanupP2p() {
+        stationNetworkCallback
+            ?.let { callback ->
+                runCatching {
+                    connectivityManager
+                        .unregisterNetworkCallback(
+                            callback,
+                        )
+                }
+            }
+
+        stationNetworkCallback =
+            null
+
         val wifi =
             p2pManager
 
@@ -1507,7 +1298,7 @@ class TuneBudsMediaSync(
 
                 Log.i(
                     TAG,
-                    "P2P RAW HTTP media download " +
+                    "STATION RAW HTTP media download " +
                         "attempt $attempt/" +
                         "$MEDIA_DOWNLOAD_MAX_ATTEMPTS: " +
                         item.remoteName,
@@ -1533,7 +1324,7 @@ class TuneBudsMediaSync(
 
                         Log.w(
                             TAG,
-                            "P2P RAW HTTP stream closed with error " +
+                            "STATION RAW HTTP stream closed with error " +
                                 "after ${result.copied} bytes: " +
                                 result.readError.message,
                         )
@@ -1547,7 +1338,7 @@ class TuneBudsMediaSync(
 
                     Log.i(
                         TAG,
-                        "P2P RAW HTTP received=${output.length()}, " +
+                        "STATION RAW HTTP received=${output.length()}, " +
                             "advertised=${result.advertisedLength}, " +
                             "valid=$valid, " +
                             "file=${item.fileName}",
@@ -1556,7 +1347,7 @@ class TuneBudsMediaSync(
                     if (valid) {
                         Log.i(
                             TAG,
-                            "Media accepted after P2P RAW HTTP: " +
+                            "Media accepted after STATION RAW HTTP: " +
                                 "${output.length()} bytes",
                         )
 
@@ -1585,7 +1376,7 @@ class TuneBudsMediaSync(
 
                     Log.w(
                         TAG,
-                        "P2P RAW HTTP attempt $attempt failed: " +
+                        "STATION RAW HTTP attempt $attempt failed: " +
                             (error.message
                                 ?: error.javaClass.simpleName),
                         error,
@@ -1603,7 +1394,7 @@ class TuneBudsMediaSync(
             }
 
             throw IOException(
-                "TuneBuds P2P RAW media download failed " +
+                "TuneBuds station RAW media download failed " +
                     "after $MEDIA_DOWNLOAD_MAX_ATTEMPTS attempts; " +
                     "last=${output.length()} bytes, " +
                     "advertised=" +
@@ -1709,7 +1500,7 @@ class TuneBudsMediaSync(
 
             Log.i(
                 TAG,
-                "P2P RAW HTTP response=${response.first}, " +
+                "STATION RAW HTTP response=${response.first}, " +
                     "contentLength=$advertisedLength, " +
                     "connection=${response.second["connection"]}, " +
                     "file=${item.fileName}",
@@ -1958,7 +1749,7 @@ class TuneBudsMediaSync(
             ) {
                 Log.w(
                     TAG,
-                    "P2P Network socketFactory failed: ${error.message}",
+                    "Station Network socketFactory failed: ${error.message}",
                 )
                 null
             }
