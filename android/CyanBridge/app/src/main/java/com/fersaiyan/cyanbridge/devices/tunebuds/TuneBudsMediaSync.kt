@@ -270,7 +270,7 @@ private data class RawHttpDownloadResult(
 /**
  * TuneBuds / AB Mate media synchronization.
  *
- * E1749 build #28:
+ * E1749 build #32 diagnostic:
  * - Restores the vendor-style Wi-Fi Direct path: E6 mode 2.
  * - Uses F2 as the authoritative P2P peer MAC.
  * - Uses the E7 endpoint as the authoritative media HTTP base URL.
@@ -410,7 +410,24 @@ class TuneBudsMediaSync(
             )
 
             val connection =
-                establishP2pFileManager()
+                establishP2pFileManager { diagnostic ->
+                    state =
+                        state.copy(
+                            detail =
+                                diagnostic,
+                            lastError =
+                                null,
+                        )
+
+                    Log.i(
+                        TAG,
+                        diagnostic,
+                    )
+
+                    onState(
+                        state,
+                    )
+                }
 
             state =
                 state.copy(
@@ -702,9 +719,24 @@ class TuneBudsMediaSync(
      * with intent 15. WifiP2pManagerSingleton exposes that intent in the companion
      * change that accompanies this file.
      */
-    private suspend fun establishP2pFileManager():
-        TuneBudsP2pFileManagerInfo =
+    private suspend fun establishP2pFileManager(
+        onDiagnostic:
+            suspend (
+                String,
+            ) -> Unit,
+    ): TuneBudsP2pFileManagerInfo =
         coroutineScope {
+
+            fun report(
+                message:
+                    String,
+            ) {
+                launch {
+                    onDiagnostic(
+                        message,
+                    )
+                }
+            }
 
             val wifi =
                 WifiP2pManagerSingleton
@@ -713,6 +745,10 @@ class TuneBudsMediaSync(
                     )
 
             if (!wifi.canUseP2p()) {
+                onDiagnostic(
+                    "D2a/7: SIN permiso Nearby Wi-Fi / ubicación",
+                )
+
                 throw SecurityException(
                     "Nearby Wi-Fi permission is required for TuneBuds P2P sync",
                 )
@@ -817,6 +853,11 @@ class TuneBudsMediaSync(
                         "reported=${manager.state.value.p2pPeerAddress}",
                 )
 
+                report(
+                    "D2c/7: Peer encontrado: " +
+                        "${target.deviceAddress}",
+                )
+
                 wifi.connectToDevice(
                     target,
                     groupOwnerIntent = 15,
@@ -836,6 +877,10 @@ class TuneBudsMediaSync(
                     }
 
                     override fun onWifiP2pDisabled() {
+                        report(
+                            "D2a/7: Wi-Fi Direct desactivado en Android",
+                        )
+
                         if (
                             !connected.isCompleted
                         ) {
@@ -895,6 +940,11 @@ class TuneBudsMediaSync(
                                     "owner=${info.groupOwnerAddress?.hostAddress}",
                             )
 
+                            report(
+                                "D2e/7: Grupo P2P formado; " +
+                                    "móvilOwner=${info.isGroupOwner}",
+                            )
+
                             connected.complete(
                                 info,
                             )
@@ -923,12 +973,20 @@ class TuneBudsMediaSync(
                             TAG,
                             "E1749 P2P discovery failed: $reason",
                         )
+
+                        report(
+                            "D2a/7: Descubrimiento P2P falló (código $reason)",
+                        )
                     }
 
                     override fun onConnectRequestSent() {
                         Log.i(
                             TAG,
                             "E1749 P2P connect request accepted",
+                        )
+
+                        report(
+                            "D2d/7: Solicitud P2P enviada",
                         )
                     }
 
@@ -939,6 +997,10 @@ class TuneBudsMediaSync(
                         Log.w(
                             TAG,
                             "E1749 P2P connect request failed: $reason",
+                        )
+
+                        report(
+                            "D2d/7: Solicitud P2P FALLÓ (código $reason)",
                         )
                     }
 
@@ -990,6 +1052,10 @@ class TuneBudsMediaSync(
 
             val handshake =
                 async {
+                    onDiagnostic(
+                        "D2a/7: Solicitando E6 modo 2 + E7",
+                    )
+
                     manager
                         .startFileManagerP2p(
                             p2pSsid =
@@ -1017,6 +1083,10 @@ class TuneBudsMediaSync(
                     Log.i(
                         TAG,
                         "E1749 F2 peer available: $peer",
+                    )
+
+                    onDiagnostic(
+                        "D2b/7: F2 recibido: $peer",
                     )
 
                     /*
@@ -1101,6 +1171,10 @@ class TuneBudsMediaSync(
                     "E1749 P2P file manager ready: " +
                         "peer=${fileManagerInfo.peerAddress}, " +
                         "endpoint=${fileManagerInfo.endpoint}",
+                )
+
+                onDiagnostic(
+                    "D2f/7: E7 recibido: ${fileManagerInfo.endpoint}",
                 )
 
                 fileManagerInfo
