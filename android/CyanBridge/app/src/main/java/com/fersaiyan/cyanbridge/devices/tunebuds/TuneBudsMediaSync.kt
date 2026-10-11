@@ -1,4 +1,4 @@
-package com.fersaiyan.cyanbridge.devices.tunebuds
+package com.fersaiyan.cyanberidge.devices.tunebuds
 
 import android.annotation.SuppressLint
 import android.content.Context
@@ -272,7 +272,7 @@ private data class RawHttpDownloadResult(
 /**
  * TuneBuds / AB Mate media synchronization.
  *
- * E1749 build #25:
+ * E1749 build #27:
  * - Diagnostic station fallback: E6 mode 1.
  * - Requests a temporary glasses-created Wi-Fi network with a known SSID/passphrase.
  * - Keeps the E7 endpoint authoritative.
@@ -296,10 +296,10 @@ class TuneBudsMediaSync(
             4_000
 
         private const val MEDIA_DOWNLOAD_MAX_ATTEMPTS =
-            5
+            12
 
         private const val MEDIA_DOWNLOAD_RETRY_MS =
-            750L
+            500L
 
         private const val RAW_HTTP_CONNECT_TIMEOUT_MS =
             20_000
@@ -1291,17 +1291,19 @@ class TuneBudsMediaSync(
                 coroutineContext
                     .ensureActive()
 
-                output.delete()
-
                 val attempt =
                     index + 1
 
+                val resumeFrom =
+                    output.length()
+
                 Log.i(
                     TAG,
-                    "STATION RAW HTTP media download " +
+                    "STATION RESUME media download " +
                         "attempt $attempt/" +
                         "$MEDIA_DOWNLOAD_MAX_ATTEMPTS: " +
-                        item.remoteName,
+                        item.remoteName +
+                        ", resumeFrom=$resumeFrom",
                 )
 
                 try {
@@ -1311,6 +1313,7 @@ class TuneBudsMediaSync(
                             output,
                             item,
                             onProgress,
+                            resumeFrom,
                         )
 
                     lastAdvertisedLength =
@@ -1324,9 +1327,10 @@ class TuneBudsMediaSync(
 
                         Log.w(
                             TAG,
-                            "STATION RAW HTTP stream closed with error " +
-                                "after ${result.copied} bytes: " +
-                                result.readError.message,
+                            "STATION RESUME stream incomplete; " +
+                                "saved=${output.length()} bytes, " +
+                                "expected=${result.advertisedLength}, " +
+                                "error=${result.readError.message}",
                         )
                     }
 
@@ -1338,7 +1342,7 @@ class TuneBudsMediaSync(
 
                     Log.i(
                         TAG,
-                        "STATION RAW HTTP received=${output.length()}, " +
+                        "STATION RESUME saved=${output.length()}, " +
                             "advertised=${result.advertisedLength}, " +
                             "valid=$valid, " +
                             "file=${item.fileName}",
@@ -1347,7 +1351,7 @@ class TuneBudsMediaSync(
                     if (valid) {
                         Log.i(
                             TAG,
-                            "Media accepted after STATION RAW HTTP: " +
+                            "Media accepted after resumable station HTTP: " +
                                 "${output.length()} bytes",
                         )
 
@@ -1376,7 +1380,8 @@ class TuneBudsMediaSync(
 
                     Log.w(
                         TAG,
-                        "STATION RAW HTTP attempt $attempt failed: " +
+                        "STATION RESUME attempt $attempt failed; " +
+                            "keeping ${output.length()} bytes: " +
                             (error.message
                                 ?: error.javaClass.simpleName),
                         error,
@@ -1394,9 +1399,9 @@ class TuneBudsMediaSync(
             }
 
             throw IOException(
-                "TuneBuds station RAW media download failed " +
+                "TuneBuds resumable station download failed " +
                     "after $MEDIA_DOWNLOAD_MAX_ATTEMPTS attempts; " +
-                    "last=${output.length()} bytes, " +
+                    "saved=${output.length()} bytes, " +
                     "advertised=" +
                     if (
                         lastAdvertisedLength > 0L
@@ -1422,6 +1427,8 @@ class TuneBudsMediaSync(
                 Long,
                 Long,
             ) -> Unit,
+        resumeFrom:
+            Long = 0L,
     ): RawHttpDownloadResult {
 
         val url =
@@ -1443,6 +1450,11 @@ class TuneBudsMediaSync(
                 url,
             )
 
+        val requestedOffset =
+            resumeFrom.coerceAtLeast(
+                0L,
+            )
+
         val socket =
             createRoutedSocket(
                 url.host,
@@ -1460,6 +1472,11 @@ class TuneBudsMediaSync(
                 url,
                 port,
                 path,
+                rangeStart =
+                    requestedOffset
+                        .takeIf {
+                            it > 0L
+                        },
             )
 
             val input =
@@ -1474,12 +1491,58 @@ class TuneBudsMediaSync(
                     item.fileName,
                 )
 
-            val advertisedLength =
+            val statusCode =
+                response.first
+
+            val responseLength =
                 response.second[
                     "content-length"
                 ]
                     ?.toLongOrNull()
                     ?: -1L
+
+            val contentRange =
+                response.second[
+                    "content-range"
+                ]
+
+            val rangeTotal =
+                contentRange
+                    ?.substringAfterLast(
+                        '/',
+                        "",
+                    )
+                    ?.takeIf {
+                        it.isNotBlank() &&
+                            it != "*"
+                    }
+                    ?.toLongOrNull()
+
+            val rangeStart =
+                contentRange
+                    ?.substringAfter(
+                        "bytes ",
+                        "",
+                    )
+                    ?.substringBefore(
+                        '-',
+                        "",
+                    )
+                    ?.trim()
+                    ?.toLongOrNull()
+
+            val advertisedLength =
+                rangeTotal
+                    ?: if (
+                        statusCode == 206 &&
+                        requestedOffset > 0L &&
+                        responseLength >= 0L
+                    ) {
+                        requestedOffset +
+                            responseLength
+                    } else {
+                        responseLength
+                    }
 
             val transferEncoding =
                 response.second[
@@ -1498,84 +1561,312 @@ class TuneBudsMediaSync(
                 )
             }
 
+            var appendOffset =
+                0L
+
+            var bytesToDiscard =
+                0L
+
+            when {
+                requestedOffset <= 0L -> {
+                    appendOffset =
+                        0L
+                }
+
+                statusCode == 206 -> {
+                    if (
+                        rangeStart != null &&
+                        rangeStart !=
+                        requestedOffset
+                    ) {
+                        throw IOException(
+                            "TuneBuds resumed at byte $rangeStart " +
+                                "instead of requested byte $requestedOffset",
+                        )
+                    }
+
+                    appendOffset =
+                        requestedOffset
+                }
+
+                statusCode == 200 -> {
+                    /*
+                     * Some tiny embedded HTTP servers ignore Range. Preserve the
+                     * partial file and consume the already-saved prefix from the
+                     * new full response before appending new bytes.
+                     */
+                    appendOffset =
+                        requestedOffset
+
+                    bytesToDiscard =
+                        requestedOffset
+
+                    Log.w(
+                        TAG,
+                        "TuneBuds ignored Range; using manual prefix skip " +
+                            "of $bytesToDiscard bytes",
+                    )
+                }
+
+                else -> {
+                    throw IOException(
+                        "Unexpected HTTP $statusCode while resuming " +
+                            "at byte $requestedOffset",
+                    )
+                }
+            }
+
             Log.i(
                 TAG,
-                "STATION RAW HTTP response=${response.first}, " +
-                    "contentLength=$advertisedLength, " +
-                    "connection=${response.second["connection"]}, " +
+                "STATION RESUME HTTP response=$statusCode, " +
+                    "contentLength=$responseLength, " +
+                    "contentRange=$contentRange, " +
+                    "resume=$requestedOffset, " +
+                    "advertised=$advertisedLength, " +
                     "file=${item.fileName}",
             )
-
-            var copied =
-                0L
 
             var readError:
                 IOException? = null
 
-            output
-                .outputStream()
-                .buffered(
-                    128 * 1024,
-                )
-                .use { target ->
+            if (
+                bytesToDiscard >
+                0L
+            ) {
+                var remainingSkip =
+                    bytesToDiscard
 
-                    val buffer =
-                        ByteArray(
-                            128 * 1024,
-                        )
+                val skipBuffer =
+                    ByteArray(
+                        64 * 1024,
+                    )
 
-                    while (true) {
-                        coroutineContext
-                            .ensureActive()
+                while (
+                    remainingSkip >
+                    0L
+                ) {
+                    coroutineContext
+                        .ensureActive()
 
-                        val count =
-                            try {
-                                input.read(
-                                    buffer,
-                                )
-                            } catch (
-                                error:
-                                    IOException,
-                            ) {
-                                readError =
-                                    error
-                                break
-                            }
-
-                        if (
-                            count < 0
+                    val count =
+                        try {
+                            input.read(
+                                skipBuffer,
+                                0,
+                                minOf(
+                                    skipBuffer.size.toLong(),
+                                    remainingSkip,
+                                ).toInt(),
+                            )
+                        } catch (
+                            error:
+                                IOException,
                         ) {
+                            readError =
+                                error
                             break
                         }
 
-                        if (
-                            count == 0
-                        ) {
-                            continue
-                        }
+                    if (
+                        count <
+                        0
+                    ) {
+                        readError =
+                            IOException(
+                                "Connection ended while skipping the " +
+                                    "already-downloaded prefix at " +
+                                    "${bytesToDiscard - remainingSkip}/$bytesToDiscard bytes",
+                            )
+                        break
+                    }
 
-                        target.write(
-                            buffer,
-                            0,
-                            count,
-                        )
-
-                        copied +=
+                    if (
+                        count >
+                        0
+                    ) {
+                        remainingSkip -=
                             count
+                    }
+                }
 
-                        onProgress(
-                            item,
-                            copied,
+                if (
+                    readError != null
+                ) {
+                    return RawHttpDownloadResult(
+                        copied =
+                            output.length(),
+                        advertisedLength =
                             advertisedLength,
+                        readError =
+                            readError,
+                    )
+                }
+            }
+
+            val expectedBodyBytes =
+                when {
+                    responseLength < 0L ->
+                        -1L
+
+                    statusCode == 200 &&
+                        bytesToDiscard > 0L ->
+                        (
+                            responseLength -
+                                bytesToDiscard
+                            )
+                            .coerceAtLeast(
+                                0L,
+                            )
+
+                    else ->
+                        responseLength
+                }
+
+            var copiedThisAttempt =
+                0L
+
+            RandomAccessFile(
+                output,
+                "rw",
+            ).use { target ->
+
+                if (
+                    appendOffset <=
+                    0L
+                ) {
+                    target.setLength(
+                        0L,
+                    )
+
+                    target.seek(
+                        0L,
+                    )
+                } else {
+                    if (
+                        target.length() <
+                        appendOffset
+                    ) {
+                        throw IOException(
+                            "Partial file is shorter than resume offset",
                         )
                     }
 
-                    target.flush()
+                    target.setLength(
+                        appendOffset,
+                    )
+
+                    target.seek(
+                        appendOffset,
+                    )
                 }
+
+                val buffer =
+                    ByteArray(
+                        128 * 1024,
+                    )
+
+                while (true) {
+                    coroutineContext
+                        .ensureActive()
+
+                    if (
+                        expectedBodyBytes >=
+                        0L &&
+                        copiedThisAttempt >=
+                        expectedBodyBytes
+                    ) {
+                        break
+                    }
+
+                    val maxRead =
+                        if (
+                            expectedBodyBytes >=
+                            0L
+                        ) {
+                            minOf(
+                                buffer.size.toLong(),
+                                expectedBodyBytes -
+                                    copiedThisAttempt,
+                            ).toInt()
+                        } else {
+                            buffer.size
+                        }
+
+                    if (
+                        maxRead <=
+                        0
+                    ) {
+                        break
+                    }
+
+                    val count =
+                        try {
+                            input.read(
+                                buffer,
+                                0,
+                                maxRead,
+                            )
+                        } catch (
+                            error:
+                                IOException,
+                        ) {
+                            readError =
+                                error
+                            break
+                        }
+
+                    if (
+                        count <
+                        0
+                    ) {
+                        break
+                    }
+
+                    if (
+                        count ==
+                        0
+                    ) {
+                        continue
+                    }
+
+                    target.write(
+                        buffer,
+                        0,
+                        count,
+                    )
+
+                    copiedThisAttempt +=
+                        count
+
+                    val totalSaved =
+                        appendOffset +
+                            copiedThisAttempt
+
+                    onProgress(
+                        item,
+                        totalSaved,
+                        advertisedLength,
+                    )
+                }
+            }
+
+            if (
+                readError == null &&
+                expectedBodyBytes >=
+                0L &&
+                copiedThisAttempt <
+                expectedBodyBytes
+            ) {
+                readError =
+                    IOException(
+                        "Premature EOF after $copiedThisAttempt/" +
+                            "$expectedBodyBytes bytes in this attempt",
+                    )
+            }
 
             return RawHttpDownloadResult(
                 copied =
-                    copied,
+                    output.length(),
                 advertisedLength =
                     advertisedLength,
                 readError =
@@ -1853,6 +2144,8 @@ class TuneBudsMediaSync(
             Int,
         path:
             String,
+        rangeStart:
+            Long? = null,
     ) {
         val hostHeader =
             if (
@@ -1889,6 +2182,16 @@ class TuneBudsMediaSync(
                 append(
                     "Accept-Encoding: identity\r\n",
                 )
+
+                rangeStart
+                    ?.takeIf {
+                        it > 0L
+                    }
+                    ?.let { start ->
+                        append(
+                            "Range: bytes=$start-\r\n",
+                        )
+                    }
 
                 append(
                     "\r\n",
