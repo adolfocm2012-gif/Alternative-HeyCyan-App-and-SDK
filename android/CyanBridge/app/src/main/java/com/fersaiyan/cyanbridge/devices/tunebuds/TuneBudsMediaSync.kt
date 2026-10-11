@@ -1,4 +1,4 @@
-package com.fersaiyan.cyanberidge.devices.tunebuds
+package com.fersaiyan.cyanbridge.devices.tunebuds
 
 import android.annotation.SuppressLint
 import android.content.Context
