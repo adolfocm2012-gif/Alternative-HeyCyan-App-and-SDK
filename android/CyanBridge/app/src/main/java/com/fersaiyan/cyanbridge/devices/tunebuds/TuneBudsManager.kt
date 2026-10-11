@@ -667,8 +667,8 @@ class TuneBudsManager private constructor(context: Context) {
             async(start = CoroutineStart.UNDISPATCHED) {
                 state
                     .filter {
-                        it.wifiState == 1 &&
-                            true &&
+                        it.wifiState == 2 &&
+                            !it.p2pPeerAddress.isNullOrBlank() &&
                             !it.mediaBaseUrl.isNullOrBlank()
                     }
                     .first()
@@ -684,9 +684,9 @@ class TuneBudsManager private constructor(context: Context) {
                 request(
                     TuneBudsProtocol.CMD_CONFIGURE_WIFI,
                     TuneBudsProtocol.buildWifiPayload(
-                        mode = 1,
+                        mode = 2,
                         ssid = p2pSsid,
-                        password = "12345678",
+                        password = "",
                         channel = 0,
                     ),
                 ),
@@ -723,6 +723,7 @@ class TuneBudsManager private constructor(context: Context) {
                         }
 
                         fileManagerAttempt++
+
                         delay(
                             FILE_MANAGER_RETRY_MS,
                         )
@@ -760,7 +761,9 @@ class TuneBudsManager private constructor(context: Context) {
                         ),
                 peerAddress =
                     snapshot.p2pPeerAddress
-                        ?: "station",
+                        ?: throw IOException(
+                            "TuneBuds P2P peer address was empty",
+                        ),
             )
         } finally {
             wifiFailure.cancel()
