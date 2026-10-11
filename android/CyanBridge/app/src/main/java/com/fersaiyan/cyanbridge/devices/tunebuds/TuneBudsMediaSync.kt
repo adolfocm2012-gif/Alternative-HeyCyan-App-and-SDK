@@ -270,7 +270,7 @@ private data class RawHttpDownloadResult(
 /**
  * TuneBuds / AB Mate media synchronization.
  *
- * E1749 build #33 deep P2P diagnostic:
+ * E1749 build #34 local-hotspot media sync:
  * - Restores the vendor-style Wi-Fi Direct path: E6 mode 2.
  * - Uses F2 as the authoritative P2P peer MAC.
  * - Uses the E7 endpoint as the authoritative media HTTP base URL.
@@ -395,7 +395,7 @@ class TuneBudsMediaSync(
             state =
                 state.copy(
                     detail =
-                        "D2/7: Preparando Wi-Fi Direct P2P",
+                        "D2/7: Creando hotspot local del teléfono",
                     lastError =
                         null,
                 )
@@ -409,30 +409,13 @@ class TuneBudsMediaSync(
                 state,
             )
 
-            val connection =
-                establishP2pFileManager { diagnostic ->
-                    state =
-                        state.copy(
-                            detail =
-                                diagnostic,
-                            lastError =
-                                null,
-                        )
-
-                    Log.i(
-                        TAG,
-                        diagnostic,
-                    )
-
-                    onState(
-                        state,
-                    )
-                }
+            val credentials =
+                hotspot.start()
 
             state =
                 state.copy(
                     detail =
-                        "D3/7: P2P conectado (${connection.peerAddress})",
+                        "D3/7: Hotspot listo; conectando las gafas",
                     lastError =
                         null,
                 )
@@ -447,12 +430,25 @@ class TuneBudsMediaSync(
             )
 
             val endpoint =
-                connection.endpoint
+                manager
+                    .startFileManager(
+                        hotspotSsid =
+                            credentials.ssid,
+                        hotspotPassword =
+                            credentials.password,
+                        channel =
+                            credentials.channel,
+                        timeoutMs =
+                            45_000L,
+                    )
+                    ?: throw IOException(
+                        "TuneBuds did not report its media server address",
+                    )
 
             state =
                 state.copy(
                     detail =
-                        "D4/7: Servidor P2P recibido: $endpoint",
+                        "D4/7: Servidor de las gafas recibido: $endpoint",
                     lastError =
                         null,
                 )
@@ -508,7 +504,7 @@ class TuneBudsMediaSync(
 
             Log.i(
                 TAG,
-                "E1749 P2P media.config RAW " +
+                "E1749 hotspot media.config RAW " +
                     "length=${manifestBody.length}: " +
                     rawPreviewForLog,
             )
@@ -643,7 +639,7 @@ class TuneBudsMediaSync(
             state =
                 state.copy(
                     detail =
-                        "Sincronización P2P completada",
+                        "Sincronización por hotspot completada",
                     lastError =
                         null,
                 )
@@ -678,7 +674,7 @@ class TuneBudsMediaSync(
 
             Log.e(
                 TAG,
-                "E1749 P2P sync failed at [$failedAt]: $message",
+                "E1749 hotspot sync failed at [$failedAt]: $message",
                 error,
             )
 
@@ -1586,7 +1582,7 @@ class TuneBudsMediaSync(
 
                 Log.i(
                     TAG,
-                    "P2P RESUME media download " +
+                    "HOTSPOT RESUME media download " +
                         "attempt $attempt/" +
                         "$MEDIA_DOWNLOAD_MAX_ATTEMPTS: " +
                         item.remoteName +
@@ -1614,7 +1610,7 @@ class TuneBudsMediaSync(
 
                         Log.w(
                             TAG,
-                            "P2P RESUME stream incomplete; " +
+                            "HOTSPOT RESUME stream incomplete; " +
                                 "saved=${output.length()} bytes, " +
                                 "expected=${result.advertisedLength}, " +
                                 "error=${result.readError.message}",
@@ -1629,7 +1625,7 @@ class TuneBudsMediaSync(
 
                     Log.i(
                         TAG,
-                        "P2P RESUME saved=${output.length()}, " +
+                        "HOTSPOT RESUME saved=${output.length()}, " +
                             "advertised=${result.advertisedLength}, " +
                             "valid=$valid, " +
                             "file=${item.fileName}",
@@ -1638,7 +1634,7 @@ class TuneBudsMediaSync(
                     if (valid) {
                         Log.i(
                             TAG,
-                            "Media accepted after resumable P2P HTTP: " +
+                            "Media accepted after resumable hotspot HTTP: " +
                                 "${output.length()} bytes",
                         )
 
@@ -1667,7 +1663,7 @@ class TuneBudsMediaSync(
 
                     Log.w(
                         TAG,
-                        "P2P RESUME attempt $attempt failed; " +
+                        "HOTSPOT RESUME attempt $attempt failed; " +
                             "keeping ${output.length()} bytes: " +
                             (error.message
                                 ?: error.javaClass.simpleName),
@@ -1686,7 +1682,7 @@ class TuneBudsMediaSync(
             }
 
             throw IOException(
-                "TuneBuds resumable P2P download failed " +
+                "TuneBuds resumable hotspot download failed " +
                     "after $MEDIA_DOWNLOAD_MAX_ATTEMPTS attempts; " +
                     "saved=${output.length()} bytes, " +
                     "advertised=" +
@@ -1905,7 +1901,7 @@ class TuneBudsMediaSync(
 
             Log.i(
                 TAG,
-                "P2P RESUME HTTP response=$statusCode, " +
+                "HOTSPOT RESUME HTTP response=$statusCode, " +
                     "contentLength=$responseLength, " +
                     "contentRange=$contentRange, " +
                     "resume=$requestedOffset, " +
@@ -2327,7 +2323,7 @@ class TuneBudsMediaSync(
             ) {
                 Log.w(
                     TAG,
-                    "P2P Network socketFactory failed: ${error.message}",
+                    "Hotspot routed socketFactory failed: ${error.message}",
                 )
                 null
             }
