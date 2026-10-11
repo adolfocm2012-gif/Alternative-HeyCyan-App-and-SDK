@@ -632,6 +632,10 @@ class TuneBudsManager private constructor(context: Context) {
     suspend fun startFileManagerP2p(
         p2pSsid: String,
         timeoutMs: Long = 45_000L,
+        onDiagnostic:
+            suspend (
+                String,
+            ) -> Unit = {},
     ): TuneBudsP2pFileManagerInfo? = coroutineScope {
 
         if (!client.isConnected()) {
@@ -657,6 +661,11 @@ class TuneBudsManager private constructor(context: Context) {
                         )
                     }
 
+                onDiagnostic(
+                    "D2a/7: EC indicó fallo " +
+                        "(estado ${failed.wifiState})",
+                )
+
                 throw IOException(
                     "TuneBuds P2P failed " +
                         "(Wi-Fi state ${failed.wifiState})",
@@ -680,7 +689,11 @@ class TuneBudsManager private constructor(context: Context) {
                 "E1749: configuring Wi-Fi Direct P2P, ssid=$p2pSsid",
             )
 
-            requireSuccess(
+            onDiagnostic(
+                "D2a1/7: Enviando E6 modo 2",
+            )
+
+            val wifiResponse =
                 request(
                     TuneBudsProtocol.CMD_CONFIGURE_WIFI,
                     TuneBudsProtocol.buildWifiPayload(
@@ -689,12 +702,28 @@ class TuneBudsManager private constructor(context: Context) {
                         password = "",
                         channel = 0,
                     ),
-                ),
+                )
+
+            onDiagnostic(
+                "D2a2/7: E6 respondió",
+            )
+
+            requireSuccess(
+                wifiResponse,
+            )
+
+            onDiagnostic(
+                "D2a3/7: E6 aceptado",
             )
 
             var fileManagerAttempt = 1
 
             while (true) {
+                onDiagnostic(
+                    "D2a4/7: Solicitando E7 " +
+                        "(intento $fileManagerAttempt)",
+                )
+
                 val response =
                     request(
                         TuneBudsProtocol.CMD_FILE_MANAGER,
@@ -706,12 +735,23 @@ class TuneBudsManager private constructor(context: Context) {
                             response.payload,
                         )
                 ) {
-                    0 -> break
+                    0 -> {
+                        onDiagnostic(
+                            "D2a5/7: E7 aceptado",
+                        )
+
+                        break
+                    }
 
                     1,
                     3,
                     5,
                     -> {
+                        onDiagnostic(
+                            "D2a4/7: E7 ocupado " +
+                                "(estado $status, intento $fileManagerAttempt)",
+                        )
+
                         if (
                             fileManagerAttempt >=
                             FILE_MANAGER_MAX_ATTEMPTS
@@ -730,12 +770,21 @@ class TuneBudsManager private constructor(context: Context) {
                     }
 
                     null -> {
+                        onDiagnostic(
+                            "D2a4/7: E7 respondió sin estado",
+                        )
+
                         throw IOException(
                             "TuneBuds P2P file manager returned no status",
                         )
                     }
 
                     else -> {
+                        onDiagnostic(
+                            "D2a4/7: E7 falló " +
+                                "(estado $status)",
+                        )
+
                         throw IOException(
                             "TuneBuds P2P file manager failed " +
                                 "with status $status",
@@ -744,14 +793,31 @@ class TuneBudsManager private constructor(context: Context) {
                 }
             }
 
+            onDiagnostic(
+                "D2a6/7: Esperando EC=2 + F2 + endpoint E7",
+            )
+
             val snapshot =
                 withTimeoutOrNull(timeoutMs) {
                     ready.await()
                 }
-                    ?: throw IOException(
-                        "TuneBuds did not report P2P state, peer MAC " +
-                            "and media endpoint within ${timeoutMs / 1000}s",
-                    )
+
+            if (snapshot == null) {
+                val current =
+                    state.value
+
+                onDiagnostic(
+                    "D2a6/7 TIMEOUT: " +
+                        "EC=${current.wifiState ?: "?"} " +
+                        "F2=${if (current.p2pPeerAddress.isNullOrBlank()) "NO" else "SI"} " +
+                        "E7=${if (current.mediaBaseUrl.isNullOrBlank()) "NO" else "SI"}",
+                )
+
+                throw IOException(
+                    "TuneBuds did not report P2P state, peer MAC " +
+                        "and media endpoint within ${timeoutMs / 1000}s",
+                )
+            }
 
             TuneBudsP2pFileManagerInfo(
                 endpoint =
