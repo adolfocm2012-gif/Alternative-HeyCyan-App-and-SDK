@@ -270,7 +270,7 @@ private data class RawHttpDownloadResult(
 /**
  * TuneBuds / AB Mate media synchronization.
  *
- * E1749 build #32 diagnostic:
+ * E1749 build #33 deep P2P diagnostic:
  * - Restores the vendor-style Wi-Fi Direct path: E6 mode 2.
  * - Uses F2 as the authoritative P2P peer MAC.
  * - Uses the E7 endpoint as the authoritative media HTTP base URL.
@@ -1062,6 +1062,8 @@ class TuneBudsMediaSync(
                                 p2pSsid,
                             timeoutMs =
                                 P2P_CONNECT_TIMEOUT_MS,
+                            onDiagnostic =
+                                onDiagnostic,
                         )
                         ?: throw IOException(
                             "TuneBuds did not start its P2P file manager",
