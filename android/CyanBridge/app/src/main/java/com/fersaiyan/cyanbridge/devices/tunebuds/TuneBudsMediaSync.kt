@@ -3,6 +3,7 @@ package com.fersaiyan.cyanbridge.devices.tunebuds
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.BitmapFactory
+import android.media.MediaExtractor
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -277,7 +278,7 @@ private class EmptyRemoteMediaException(
 /**
  * TuneBuds / AB Mate media synchronization.
  *
- * E1749 build #39 clean empty-sync and camera/file-manager shutdown:
+ * E1749 build #40 Android MP4 parser fallback:
  * - Restores the vendor-style Wi-Fi Direct path: E6 mode 2.
  * - Uses F2 as the authoritative P2P peer MAC.
  * - Uses the E7 endpoint as the authoritative media HTTP base URL.
@@ -2997,155 +2998,251 @@ class TuneBudsMediaSync(
             return false
         }
 
-        return runCatching {
-            RandomAccessFile(
-                file,
-                "r",
-            ).use { raf ->
+        val strictValid =
+            runCatching {
+                RandomAccessFile(
+                    file,
+                    "r",
+                ).use { raf ->
 
-                val fileLength =
-                    raf.length()
+                    val fileLength =
+                        raf.length()
 
-                var position =
-                    0L
+                    var position =
+                        0L
 
-                var hasFtyp =
-                    false
+                    var hasFtyp =
+                        false
 
-                var hasMoov =
-                    false
+                    var hasMoov =
+                        false
 
-                var hasMdat =
-                    false
+                    var hasMdat =
+                        false
 
-                while (
-                    position <
-                    fileLength
-                ) {
-                    if (
-                        fileLength -
+                    while (
                         position <
-                        8L
-                    ) {
-                        return@use false
-                    }
-
-                    raf.seek(
-                        position,
-                    )
-
-                    val size32 =
-                        raf
-                            .readInt()
-                            .toLong() and
-                            0xffffffffL
-
-                    val typeBytes =
-                        ByteArray(
-                            4,
-                        )
-
-                    raf.readFully(
-                        typeBytes,
-                    )
-
-                    val type =
-                        String(
-                            typeBytes,
-                            StandardCharsets.ISO_8859_1,
-                        )
-
-                    var headerSize =
-                        8L
-
-                    val boxSize =
-                        when (
-                            size32
-                        ) {
-                            0L -> {
-                                fileLength -
-                                    position
-                            }
-
-                            1L -> {
-                                if (
-                                    fileLength -
-                                    position <
-                                    16L
-                                ) {
-                                    return@use false
-                                }
-
-                                headerSize =
-                                    16L
-
-                                val extended =
-                                    raf.readLong()
-
-                                if (
-                                    extended <=
-                                    0L
-                                ) {
-                                    return@use false
-                                }
-
-                                extended
-                            }
-
-                            else ->
-                                size32
-                        }
-
-                    if (
-                        boxSize <
-                        headerSize
-                    ) {
-                        return@use false
-                    }
-
-                    val end =
-                        position +
-                            boxSize
-
-                    if (
-                        end <
-                        position ||
-                        end >
                         fileLength
                     ) {
-                        return@use false
+                        if (
+                            fileLength -
+                            position <
+                            8L
+                        ) {
+                            return@use false
+                        }
+
+                        raf.seek(
+                            position,
+                        )
+
+                        val size32 =
+                            raf
+                                .readInt()
+                                .toLong() and
+                                0xffffffffL
+
+                        val typeBytes =
+                            ByteArray(
+                                4,
+                            )
+
+                        raf.readFully(
+                            typeBytes,
+                        )
+
+                        val type =
+                            String(
+                                typeBytes,
+                                StandardCharsets.ISO_8859_1,
+                            )
+
+                        var headerSize =
+                            8L
+
+                        val boxSize =
+                            when (
+                                size32
+                            ) {
+                                0L -> {
+                                    fileLength -
+                                        position
+                                }
+
+                                1L -> {
+                                    if (
+                                        fileLength -
+                                        position <
+                                        16L
+                                    ) {
+                                        return@use false
+                                    }
+
+                                    headerSize =
+                                        16L
+
+                                    val extended =
+                                        raf.readLong()
+
+                                    if (
+                                        extended <=
+                                        0L
+                                    ) {
+                                        return@use false
+                                    }
+
+                                    extended
+                                }
+
+                                else ->
+                                    size32
+                            }
+
+                        if (
+                            boxSize <
+                            headerSize
+                        ) {
+                            return@use false
+                        }
+
+                        val boxEnd =
+                            position +
+                                boxSize
+
+                        if (
+                            boxEnd <
+                            position ||
+                            boxEnd >
+                            fileLength
+                        ) {
+                            return@use false
+                        }
+
+                        when (
+                            type
+                        ) {
+                            "ftyp" ->
+                                hasFtyp =
+                                    true
+
+                            "moov" ->
+                                hasMoov =
+                                    true
+
+                            "mdat" ->
+                                hasMdat =
+                                    true
+                        }
+
+                        position =
+                            boxEnd
                     }
 
-                    when (
-                        type
+                    position ==
+                        fileLength &&
+                        hasFtyp &&
+                        hasMoov &&
+                        hasMdat
+                }
+            }
+                .getOrDefault(
+                    false,
+                )
+
+        if (
+            strictValid
+        ) {
+            Log.i(
+                TAG,
+                "MP4 strict validation OK; bytes=${file.length()}",
+            )
+
+            return true
+        }
+
+        Log.w(
+            TAG,
+            "MP4 strict box validation failed; " +
+                "trying Android MediaExtractor; bytes=${file.length()}",
+        )
+
+        /*
+         * Camera MP4 files do not always match the simplistic top-level box
+         * assumptions above. Android's own media parser is a better final
+         * authority for whether the downloaded file exposes a real video track.
+         */
+        return runCatching {
+            val extractor =
+                MediaExtractor()
+
+            try {
+                extractor.setDataSource(
+                    file.absolutePath,
+                )
+
+                var hasVideoTrack =
+                    false
+
+                var videoMime:
+                    String? = null
+
+                for (
+                    index in
+                    0 until
+                    extractor.trackCount
+                ) {
+                    val format =
+                        extractor.getTrackFormat(
+                            index,
+                        )
+
+                    val mime =
+                        format.getString(
+                            android.media.MediaFormat.KEY_MIME,
+                        )
+
+                    if (
+                        mime
+                            ?.startsWith(
+                                "video/",
+                                ignoreCase = true,
+                            ) == true
                     ) {
-                        "ftyp" ->
-                            hasFtyp =
-                                true
+                        hasVideoTrack =
+                            true
 
-                        "moov" ->
-                            hasMoov =
-                                true
+                        videoMime =
+                            mime
 
-                        "mdat" ->
-                            hasMdat =
-                                true
+                        break
                     }
-
-                    position =
-                        end
                 }
 
-                position ==
-                    fileLength &&
-                    hasFtyp &&
-                    hasMoov &&
-                    hasMdat
+                Log.i(
+                    TAG,
+                    "MP4 Android parser fallback: " +
+                        "accepted=$hasVideoTrack, " +
+                        "tracks=${extractor.trackCount}, " +
+                        "videoMime=$videoMime, " +
+                        "bytes=${file.length()}",
+                )
+
+                hasVideoTrack
+            } finally {
+                extractor.release()
             }
         }
-            .getOrDefault(
-                false,
-            )
+            .getOrElse { error ->
+                Log.w(
+                    TAG,
+                    "MP4 Android parser fallback failed: " +
+                        (error.message
+                            ?: error.javaClass.simpleName),
+                    error,
+                )
+
+                false
+            }
     }
 
     private fun isCompleteJpeg(
