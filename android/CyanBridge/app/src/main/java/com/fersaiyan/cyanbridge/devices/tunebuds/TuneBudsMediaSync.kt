@@ -278,7 +278,7 @@ private class EmptyRemoteMediaException(
 /**
  * TuneBuds / AB Mate media synchronization.
  *
- * E1749 build #40 Android MP4 parser fallback:
+ * E1749 build #41 skip zero-byte items even on transport errors:
  * - Restores the vendor-style Wi-Fi Direct path: E6 mode 2.
  * - Uses F2 as the authoritative P2P peer MAC.
  * - Uses the E7 endpoint as the authoritative media HTTP base URL.
@@ -1864,6 +1864,26 @@ class TuneBudsMediaSync(
                                 ?: error.javaClass.simpleName),
                         error,
                     )
+
+                    /*
+                     * Some stale/ghost media entries fail before an HTTP body is
+                     * ever produced, so validation is never reached. If the same
+                     * item remains at zero bytes for three attempts, treat it as
+                     * unavailable for this sync and continue with the next item.
+                     */
+                    if (
+                        output.length() == 0L &&
+                        attempt >= 3
+                    ) {
+                        onDiagnostic(
+                            "D7/7: 0 bytes tras $attempt intentos; " +
+                                "saltando ${item.fileName}",
+                        )
+
+                        throw EmptyRemoteMediaException(
+                            item.remoteName,
+                        )
+                    }
                 }
 
                 if (
