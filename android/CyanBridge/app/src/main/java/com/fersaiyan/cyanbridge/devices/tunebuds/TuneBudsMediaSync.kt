@@ -1548,11 +1548,15 @@ class TuneBudsMediaSync(
             TuneBudsMediaItem,
     ): File =
         download(
-            normalizeBaseUrl(
-                baseUrl,
-            ),
-            item,
-        ) { _, _, _ -> }
+            baseUrl =
+                normalizeBaseUrl(
+                    baseUrl,
+                ),
+            item =
+                item,
+            onProgress =
+                { _, _, _ -> },
+        )
 
     fun parseManifest(
         body:
