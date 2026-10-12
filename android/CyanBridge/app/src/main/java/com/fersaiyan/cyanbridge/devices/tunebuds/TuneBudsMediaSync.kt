@@ -270,7 +270,7 @@ private data class RawHttpDownloadResult(
 /**
  * TuneBuds / AB Mate media synchronization.
  *
- * E1749 build #35 post-download validation/import diagnostic:
+ * E1749 build #36 tolerant JPEG validation:
  * - Restores the vendor-style Wi-Fi Direct path: E6 mode 2.
  * - Uses F2 as the authoritative P2P peer MAC.
  * - Uses the E7 endpoint as the authoritative media HTTP base URL.
@@ -3085,7 +3085,7 @@ class TuneBudsMediaSync(
         return runCatching {
             RandomAccessFile(
                 file,
-                "r",
+                "rw",
             ).use { raf ->
 
                 val startA =
@@ -3094,25 +3094,103 @@ class TuneBudsMediaSync(
                 val startB =
                     raf.readUnsignedByte()
 
-                raf.seek(
+                if (
+                    startA !=
+                    0xFF ||
+                    startB !=
+                    0xD8
+                ) {
+                    Log.w(
+                        TAG,
+                        "JPEG validation failed: missing SOI marker",
+                    )
+
+                    return@use false
+                }
+
+                /*
+                 * Some embedded TuneBuds HTTP responses can leave padding or
+                 * transport bytes after the real JPEG EOI marker. Android image
+                 * decoders tolerate this, but the old validator incorrectly
+                 * required FF D9 to be the final two physical bytes.
+                 *
+                 * Search backwards for the last real EOI marker and trim any
+                 * bytes that follow it. In JPEG entropy data, FF D9 is the
+                 * unescaped end-of-image marker, so the last occurrence is the
+                 * correct end of the image.
+                 */
+                var position =
                     raf.length() -
-                        2L,
-                )
+                        2L
 
-                val endA =
-                    raf.readUnsignedByte()
+                var eoiEnd =
+                    -1L
 
-                val endB =
-                    raf.readUnsignedByte()
+                while (
+                    position >=
+                    2L
+                ) {
+                    raf.seek(
+                        position,
+                    )
 
-                startA ==
-                    0xFF &&
-                    startB ==
-                    0xD8 &&
-                    endA ==
-                    0xFF &&
-                    endB ==
-                    0xD9
+                    val a =
+                        raf.readUnsignedByte()
+
+                    val b =
+                        raf.readUnsignedByte()
+
+                    if (
+                        a ==
+                        0xFF &&
+                        b ==
+                        0xD9
+                    ) {
+                        eoiEnd =
+                            position +
+                                2L
+
+                        break
+                    }
+
+                    position--
+                }
+
+                if (
+                    eoiEnd <
+                    0L
+                ) {
+                    Log.w(
+                        TAG,
+                        "JPEG validation failed: no EOI marker found; bytes=${raf.length()}",
+                    )
+
+                    return@use false
+                }
+
+                val originalLength =
+                    raf.length()
+
+                if (
+                    eoiEnd <
+                    originalLength
+                ) {
+                    val trailing =
+                        originalLength -
+                            eoiEnd
+
+                    Log.w(
+                        TAG,
+                        "JPEG has $trailing trailing byte(s) after EOI; trimming " +
+                            "$originalLength -> $eoiEnd",
+                    )
+
+                    raf.setLength(
+                        eoiEnd,
+                    )
+                }
+
+                true
             }
         }
             .getOrDefault(
