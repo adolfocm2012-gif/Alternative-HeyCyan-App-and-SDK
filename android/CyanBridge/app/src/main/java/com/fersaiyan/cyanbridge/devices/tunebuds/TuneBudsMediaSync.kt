@@ -268,10 +268,16 @@ private data class RawHttpDownloadResult(
     val readError: IOException?,
 )
 
+private class EmptyRemoteMediaException(
+    val remoteName: String,
+) : IOException(
+    "TuneBuds returned an empty media file: $remoteName",
+)
+
 /**
  * TuneBuds / AB Mate media synchronization.
  *
- * E1749 build #37 Android JPEG decoder fallback:
+ * E1749 build #38 skip empty remote media and continue:
  * - Restores the vendor-style Wi-Fi Direct path: E6 mode 2.
  * - Uses F2 as the authoritative P2P peer MAC.
  * - Uses the E7 endpoint as the authoritative media HTTP base URL.
@@ -571,6 +577,9 @@ class TuneBudsMediaSync(
             var completed =
                 0
 
+            var skippedEmpty =
+                0
+
             for (item in items) {
                 coroutineContext
                     .ensureActive()
@@ -593,27 +602,53 @@ class TuneBudsMediaSync(
                 )
 
                 val file =
-                    download(
-                        baseUrl,
-                        item,
-                        onProgress,
-                    ) { diagnostic ->
+                    try {
+                        download(
+                            baseUrl,
+                            item,
+                            onProgress,
+                        ) { diagnostic ->
+                            state =
+                                state.copy(
+                                    detail =
+                                        diagnostic,
+                                    lastError =
+                                        null,
+                                )
+
+                            Log.i(
+                                TAG,
+                                diagnostic,
+                            )
+
+                            onState(
+                                state,
+                            )
+                        }
+                    } catch (
+                        error:
+                            EmptyRemoteMediaException,
+                    ) {
+                        skippedEmpty++
+
                         state =
                             state.copy(
                                 detail =
-                                    diagnostic,
+                                    "D7/7: Archivo vacío saltado: ${item.fileName}",
                                 lastError =
-                                    null,
+                                    "El servidor devolvió 0 bytes; se reintentará en otra sincronización",
                             )
 
-                        Log.i(
+                        Log.w(
                             TAG,
-                            diagnostic,
+                            "Skipping empty TuneBuds media item: ${item.remoteName}",
                         )
 
                         onState(
                             state,
                         )
+
+                        continue
                     }
 
                 state =
@@ -732,7 +767,12 @@ class TuneBudsMediaSync(
             state =
                 state.copy(
                     detail =
-                        "Sincronización por hotspot completada",
+                        if (skippedEmpty > 0) {
+                            "Sincronización completada: $completed importado(s), " +
+                                "$skippedEmpty vacío(s) saltado(s)"
+                        } else {
+                            "Sincronización por hotspot completada"
+                        },
                     lastError =
                         null,
                 )
@@ -1759,6 +1799,19 @@ class TuneBudsMediaSync(
                     }
 
                     if (
+                        output.length() == 0L &&
+                        attempt >= 3
+                    ) {
+                        onDiagnostic(
+                            "D7b/7: 0 bytes tras $attempt intentos; saltando ${item.fileName}",
+                        )
+
+                        throw EmptyRemoteMediaException(
+                            item.remoteName,
+                        )
+                    }
+
+                    if (
                         result.readError == null
                     ) {
                         lastFailure =
@@ -1769,6 +1822,11 @@ class TuneBudsMediaSync(
                 } catch (
                     error:
                         CancellationException,
+                ) {
+                    throw error
+                } catch (
+                    error:
+                        EmptyRemoteMediaException,
                 ) {
                     throw error
                 } catch (
