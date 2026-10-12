@@ -277,7 +277,7 @@ private class EmptyRemoteMediaException(
 /**
  * TuneBuds / AB Mate media synchronization.
  *
- * E1749 build #38 skip empty remote media and continue:
+ * E1749 build #39 clean empty-sync and camera/file-manager shutdown:
  * - Restores the vendor-style Wi-Fi Direct path: E6 mode 2.
  * - Uses F2 as the authoritative P2P peer MAC.
  * - Uses the E7 endpoint as the authoritative media HTTP base URL.
@@ -541,36 +541,36 @@ class TuneBudsMediaSync(
             )
 
             if (items.isEmpty()) {
-                val rawPreviewForUi =
+                val rawPreviewForLog =
                     manifestPreview(
                         manifestBody,
-                        RAW_PREVIEW_UI_LIMIT,
+                        RAW_PREVIEW_LOG_LIMIT,
                     )
 
-                val diagnostic =
-                    "media.config RAW " +
-                        "(${manifestBody.length} chars): " +
-                        rawPreviewForUi
-
-                Log.w(
+                Log.i(
                     TAG,
-                    "E1749 $diagnostic",
+                    "E1749 media.config contains no compatible media: " +
+                        rawPreviewForLog,
                 )
 
                 state =
                     state.copy(
+                        total =
+                            0,
+                        completed =
+                            0,
                         detail =
-                            "D6/7: media.config sin archivos compatibles",
+                            "Sincronización completada: no hay archivos pendientes",
                         lastError =
-                            diagnostic,
+                            null,
                     )
 
                 onState(
                     state,
                 )
 
-                throw IOException(
-                    diagnostic,
+                return Result.success(
+                    0,
                 )
             }
 
@@ -830,6 +830,25 @@ class TuneBudsMediaSync(
             withContext(
                 NonCancellable,
             ) {
+                /*
+                 * E7 leaves the camera/file-transfer subsystem active on this
+                 * firmware. Always send E2 before tearing down Wi-Fi so a sync
+                 * (including an empty sync or a failed download) cannot leave
+                 * Photo/Video controls stuck in a busy/transfer state.
+                 */
+                runCatching {
+                    manager
+                        .finishTransferBlocking()
+                }.onFailure { error ->
+                    Log.w(
+                        TAG,
+                        "E1749 camera/file-manager cleanup failed: " +
+                            (error.message
+                                ?: error.javaClass.simpleName),
+                        error,
+                    )
+                }
+
                 cleanupP2p()
 
                 hotspot.stop()
