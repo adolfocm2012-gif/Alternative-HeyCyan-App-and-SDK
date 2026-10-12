@@ -270,7 +270,7 @@ private data class RawHttpDownloadResult(
 /**
  * TuneBuds / AB Mate media synchronization.
  *
- * E1749 build #34 local-hotspot media sync:
+ * E1749 build #35 post-download validation/import diagnostic:
  * - Restores the vendor-style Wi-Fi Direct path: E6 mode 2.
  * - Uses F2 as the authoritative P2P peer MAC.
  * - Uses the E7 endpoint as the authoritative media HTTP base URL.
@@ -596,7 +596,41 @@ class TuneBudsMediaSync(
                         baseUrl,
                         item,
                         onProgress,
+                    ) { diagnostic ->
+                        state =
+                            state.copy(
+                                detail =
+                                    diagnostic,
+                                lastError =
+                                    null,
+                            )
+
+                        Log.i(
+                            TAG,
+                            diagnostic,
+                        )
+
+                        onState(
+                            state,
+                        )
+                    }
+
+                state =
+                    state.copy(
+                        detail =
+                            "D7c/7: Archivo válido; importando ${item.fileName}",
+                        lastError =
+                            null,
                     )
+
+                Log.i(
+                    TAG,
+                    state.detail,
+                )
+
+                onState(
+                    state,
+                )
 
                 val imported =
                     try {
@@ -604,15 +638,73 @@ class TuneBudsMediaSync(
                             item,
                             file,
                         )
+                    } catch (
+                        error:
+                            Throwable,
+                    ) {
+                        state =
+                            state.copy(
+                                detail =
+                                    "D7d/7: IMPORTACIÓN lanzó error",
+                                lastError =
+                                    error.message
+                                        ?: error.javaClass.simpleName,
+                            )
+
+                        Log.e(
+                            TAG,
+                            state.detail,
+                            error,
+                        )
+
+                        onState(
+                            state,
+                        )
+
+                        throw error
                     } finally {
                         file.delete()
                     }
 
                 if (!imported) {
+                    state =
+                        state.copy(
+                            detail =
+                                "D7d/7: IMPORTACIÓN FALLÓ",
+                            lastError =
+                                "onFile devolvió false para ${item.fileName}",
+                        )
+
+                    Log.e(
+                        TAG,
+                        state.detail,
+                    )
+
+                    onState(
+                        state,
+                    )
+
                     throw IOException(
                         "Could not import ${item.fileName}",
                     )
                 }
+
+                state =
+                    state.copy(
+                        detail =
+                            "D7d/7: Importación OK: ${item.fileName}",
+                        lastError =
+                            null,
+                    )
+
+                Log.i(
+                    TAG,
+                    state.detail,
+                )
+
+                onState(
+                    state,
+                )
 
                 completed++
 
@@ -1542,6 +1634,10 @@ class TuneBudsMediaSync(
                 Long,
                 Long,
             ) -> Unit,
+        onDiagnostic:
+            suspend (
+                String,
+            ) -> Unit = {},
     ): File =
         withContext(
             Dispatchers.IO,
@@ -1615,13 +1711,29 @@ class TuneBudsMediaSync(
                                 "expected=${result.advertisedLength}, " +
                                 "error=${result.readError.message}",
                         )
+
+                        onDiagnostic(
+                            "D7a/7: Flujo incompleto: ${output.length()} bytes; reintentando",
+                        )
                     }
+
+                    onDiagnostic(
+                        "D7a/7: Recibidos ${output.length()} bytes; validando ${item.fileName}",
+                    )
 
                     val valid =
                         validateDownloadedMedia(
                             item,
                             output,
                         )
+
+                    onDiagnostic(
+                        if (valid) {
+                            "D7b/7: Validación OK (${output.length()} bytes)"
+                        } else {
+                            "D7b/7: VALIDACIÓN FALLÓ (${output.length()} bytes)"
+                        },
+                    )
 
                     Log.i(
                         TAG,
