@@ -2,6 +2,7 @@ package com.fersaiyan.cyanbridge.devices.tunebuds
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.BitmapFactory
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -270,7 +271,7 @@ private data class RawHttpDownloadResult(
 /**
  * TuneBuds / AB Mate media synchronization.
  *
- * E1749 build #36 tolerant JPEG validation:
+ * E1749 build #37 Android JPEG decoder fallback:
  * - Restores the vendor-style Wi-Fi Direct path: E6 mode 2.
  * - Uses F2 as the authoritative P2P peer MAC.
  * - Uses the E7 endpoint as the authoritative media HTTP base URL.
@@ -3085,46 +3086,77 @@ class TuneBudsMediaSync(
         return runCatching {
             RandomAccessFile(
                 file,
-                "rw",
+                "r",
             ).use { raf ->
 
-                val startA =
-                    raf.readUnsignedByte()
+                val length =
+                    raf.length()
 
-                val startB =
-                    raf.readUnsignedByte()
-
-                if (
-                    startA !=
-                    0xFF ||
-                    startB !=
-                    0xD8
-                ) {
-                    Log.w(
-                        TAG,
-                        "JPEG validation failed: missing SOI marker",
+                val firstCount =
+                    minOf(
+                        16,
+                        length.toInt(),
                     )
 
-                    return@use false
-                }
+                val firstBytes =
+                    ByteArray(
+                        firstCount,
+                    )
 
-                /*
-                 * Some embedded TuneBuds HTTP responses can leave padding or
-                 * transport bytes after the real JPEG EOI marker. Android image
-                 * decoders tolerate this, but the old validator incorrectly
-                 * required FF D9 to be the final two physical bytes.
-                 *
-                 * Search backwards for the last real EOI marker and trim any
-                 * bytes that follow it. In JPEG entropy data, FF D9 is the
-                 * unescaped end-of-image marker, so the last occurrence is the
-                 * correct end of the image.
-                 */
+                raf.seek(
+                    0L,
+                )
+
+                raf.readFully(
+                    firstBytes,
+                )
+
+                val tailCount =
+                    minOf(
+                        32,
+                        length.toInt(),
+                    )
+
+                val tailBytes =
+                    ByteArray(
+                        tailCount,
+                    )
+
+                raf.seek(
+                    length -
+                        tailCount,
+                )
+
+                raf.readFully(
+                    tailBytes,
+                )
+
+                fun hex(
+                    bytes:
+                        ByteArray,
+                ): String =
+                    bytes.joinToString(
+                        separator = " ",
+                    ) { value ->
+                        "%02X".format(
+                            value.toInt() and 0xFF,
+                        )
+                    }
+
+                val hasSoi =
+                    firstBytes.size >=
+                        2 &&
+                        (firstBytes[0].toInt() and 0xFF) ==
+                        0xFF &&
+                        (firstBytes[1].toInt() and 0xFF) ==
+                        0xD8
+
                 var position =
-                    raf.length() -
+                    length -
                         2L
 
-                var eoiEnd =
-                    -1L
+                var hasEoi =
+                    false
 
                 while (
                     position >=
@@ -3146,9 +3178,8 @@ class TuneBudsMediaSync(
                         b ==
                         0xD9
                     ) {
-                        eoiEnd =
-                            position +
-                                2L
+                        hasEoi =
+                            true
 
                         break
                     }
@@ -3157,40 +3188,59 @@ class TuneBudsMediaSync(
                 }
 
                 if (
-                    eoiEnd <
-                    0L
+                    hasSoi &&
+                    hasEoi
                 ) {
-                    Log.w(
+                    Log.i(
                         TAG,
-                        "JPEG validation failed: no EOI marker found; bytes=${raf.length()}",
+                        "JPEG markers OK; bytes=$length",
                     )
 
-                    return@use false
+                    return@use true
                 }
 
-                val originalLength =
-                    raf.length()
+                Log.w(
+                    TAG,
+                    "JPEG marker check failed; " +
+                        "bytes=$length, " +
+                        "SOI=$hasSoi, EOI=$hasEoi, " +
+                        "first=${hex(firstBytes)}, " +
+                        "tail=${hex(tailBytes)}",
+                )
 
-                if (
-                    eoiEnd <
-                    originalLength
-                ) {
-                    val trailing =
-                        originalLength -
-                            eoiEnd
+                /*
+                 * Some camera/embedded HTTP combinations produce JPEG files that
+                 * Android can decode even when the physical stream does not end
+                 * with a textbook EOI marker. Ask Android's real JPEG decoder
+                 * before rejecting the media.
+                 */
+                val options =
+                    BitmapFactory.Options().apply {
+                        inJustDecodeBounds =
+                            true
+                    }
 
-                    Log.w(
-                        TAG,
-                        "JPEG has $trailing trailing byte(s) after EOI; trimming " +
-                            "$originalLength -> $eoiEnd",
-                    )
+                BitmapFactory.decodeFile(
+                    file.absolutePath,
+                    options,
+                )
 
-                    raf.setLength(
-                        eoiEnd,
-                    )
-                }
+                val decoderAccepted =
+                    options.outWidth >
+                        0 &&
+                        options.outHeight >
+                        0
 
-                true
+                Log.i(
+                    TAG,
+                    "JPEG Android decoder fallback: " +
+                        "accepted=$decoderAccepted, " +
+                        "width=${options.outWidth}, " +
+                        "height=${options.outHeight}, " +
+                        "mime=${options.outMimeType}",
+                )
+
+                decoderAccepted
             }
         }
             .getOrDefault(
