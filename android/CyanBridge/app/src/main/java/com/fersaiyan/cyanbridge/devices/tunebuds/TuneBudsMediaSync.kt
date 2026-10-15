@@ -278,7 +278,7 @@ private class EmptyRemoteMediaException(
 /**
  * TuneBuds / AB Mate media synchronization.
  *
- * E1749 build #41 skip zero-byte items even on transport errors:
+ * E1749 build #42 trust complete HTTP transfer; media parsing is diagnostic only:
  * - Restores the vendor-style Wi-Fi Direct path: E6 mode 2.
  * - Uses F2 as the authoritative P2P peer MAC.
  * - Uses the E7 endpoint as the authoritative media HTTP base URL.
@@ -1782,37 +1782,66 @@ class TuneBudsMediaSync(
                         )
                     }
 
+                    val savedLength =
+                        output.length()
+
+                    val transportComplete =
+                        result.readError == null &&
+                            savedLength > 0L &&
+                            (
+                                result.advertisedLength <= 0L ||
+                                    savedLength >=
+                                    result.advertisedLength
+                                )
+
                     onDiagnostic(
-                        "D7a/7: Recibidos ${output.length()} bytes; validando ${item.fileName}",
+                        if (transportComplete) {
+                            "D7a/7: Transferencia completa: $savedLength bytes"
+                        } else {
+                            "D7a/7: Transferencia incompleta: $savedLength/" +
+                                if (result.advertisedLength > 0L) {
+                                    result.advertisedLength
+                                } else {
+                                    "?"
+                                } +
+                                " bytes"
+                        },
                     )
 
-                    val valid =
+                    val structurallyValid =
                         validateDownloadedMedia(
                             item,
                             output,
                         )
 
-                    onDiagnostic(
-                        if (valid) {
-                            "D7b/7: Validación OK (${output.length()} bytes)"
-                        } else {
-                            "D7b/7: VALIDACIÓN FALLÓ (${output.length()} bytes)"
-                        },
-                    )
-
                     Log.i(
                         TAG,
-                        "HOTSPOT RESUME saved=${output.length()}, " +
+                        "HOTSPOT RESUME saved=$savedLength, " +
                             "advertised=${result.advertisedLength}, " +
-                            "valid=$valid, " +
+                            "transportComplete=$transportComplete, " +
+                            "structuralValid=$structurallyValid, " +
                             "file=${item.fileName}",
                     )
 
-                    if (valid) {
+                    /*
+                     * The official TuneBuds client stores the HTTP payload; it does
+                     * not reject a completed transfer because of an extra local
+                     * JPEG/MP4 parser. Treat HTTP completeness as authoritative.
+                     * Structural parsing remains diagnostic only.
+                     */
+                    if (transportComplete) {
+                        onDiagnostic(
+                            if (structurallyValid) {
+                                "D7b/7: Transferencia OK; formato reconocido"
+                            } else {
+                                "D7b/7: Transferencia OK; importando formato no estándar"
+                            },
+                        )
+
                         Log.i(
                             TAG,
-                            "Media accepted after resumable hotspot HTTP: " +
-                                "${output.length()} bytes",
+                            "Media accepted after complete hotspot HTTP: " +
+                                "$savedLength bytes",
                         )
 
                         return@withContext output
@@ -1836,7 +1865,7 @@ class TuneBudsMediaSync(
                     ) {
                         lastFailure =
                             IOException(
-                                "Downloaded media is structurally incomplete",
+                                "Downloaded media transfer is incomplete",
                             )
                     }
                 } catch (
