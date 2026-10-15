@@ -278,7 +278,7 @@ private class EmptyRemoteMediaException(
 /**
  * TuneBuds / AB Mate media synchronization.
  *
- * E1749 build #42 trust complete HTTP transfer; media parsing is diagnostic only:
+ * E1749 build #43 bounded HTTP Range chunks for large media:
  * - Restores the vendor-style Wi-Fi Direct path: E6 mode 2.
  * - Uses F2 as the authoritative P2P peer MAC.
  * - Uses the E7 endpoint as the authoritative media HTTP base URL.
@@ -303,10 +303,13 @@ class TuneBudsMediaSync(
             4_000
 
         private const val MEDIA_DOWNLOAD_MAX_ATTEMPTS =
-            12
+            40
 
         private const val MEDIA_DOWNLOAD_RETRY_MS =
-            500L
+            250L
+
+        private const val MEDIA_RANGE_CHUNK_BYTES =
+            256L * 1024L
 
         private const val RAW_HTTP_CONNECT_TIMEOUT_MS =
             20_000
@@ -1994,6 +1997,17 @@ class TuneBudsMediaSync(
                     socket.getOutputStream(),
                 )
 
+            val requestedRangeEnd =
+                requestedOffset
+                    .takeIf {
+                        it > 0L
+                    }
+                    ?.let { start ->
+                        start +
+                            MEDIA_RANGE_CHUNK_BYTES -
+                            1L
+                    }
+
             sendHttpGet(
                 networkOutput,
                 url,
@@ -2004,6 +2018,8 @@ class TuneBudsMediaSync(
                         .takeIf {
                             it > 0L
                         },
+                rangeEnd =
+                    requestedRangeEnd,
             )
 
             val input =
@@ -2149,6 +2165,7 @@ class TuneBudsMediaSync(
                     "contentLength=$responseLength, " +
                     "contentRange=$contentRange, " +
                     "resume=$requestedOffset, " +
+                    "requestedEnd=${requestedRangeEnd ?: "open"}, " +
                     "advertised=$advertisedLength, " +
                     "file=${item.fileName}",
             )
@@ -2673,6 +2690,8 @@ class TuneBudsMediaSync(
             String,
         rangeStart:
             Long? = null,
+        rangeEnd:
+            Long? = null,
     ) {
         val hostHeader =
             if (
@@ -2715,8 +2734,19 @@ class TuneBudsMediaSync(
                         it > 0L
                     }
                     ?.let { start ->
+                        val end =
+                            rangeEnd
+                                ?.takeIf {
+                                    it >=
+                                        start
+                                }
+
                         append(
-                            "Range: bytes=$start-\r\n",
+                            if (end != null) {
+                                "Range: bytes=$start-$end\r\n"
+                            } else {
+                                "Range: bytes=$start-\r\n"
+                            },
                         )
                     }
 
