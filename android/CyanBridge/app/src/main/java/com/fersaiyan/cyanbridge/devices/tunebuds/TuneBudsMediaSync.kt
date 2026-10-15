@@ -278,7 +278,7 @@ private class EmptyRemoteMediaException(
 /**
  * TuneBuds / AB Mate media synchronization.
  *
- * E1749 build #43 bounded HTTP Range chunks for large media:
+ * E1749 build #44 bounded HTTP Range chunks from byte zero:
  * - Restores the vendor-style Wi-Fi Direct path: E6 mode 2.
  * - Uses F2 as the authoritative P2P peer MAC.
  * - Uses the E7 endpoint as the authoritative media HTTP base URL.
@@ -1998,15 +1998,9 @@ class TuneBudsMediaSync(
                 )
 
             val requestedRangeEnd =
-                requestedOffset
-                    .takeIf {
-                        it > 0L
-                    }
-                    ?.let { start ->
-                        start +
-                            MEDIA_RANGE_CHUNK_BYTES -
-                            1L
-                    }
+                requestedOffset +
+                    MEDIA_RANGE_CHUNK_BYTES -
+                    1L
 
             sendHttpGet(
                 networkOutput,
@@ -2014,10 +2008,7 @@ class TuneBudsMediaSync(
                 port,
                 path,
                 rangeStart =
-                    requestedOffset
-                        .takeIf {
-                            it > 0L
-                        },
+                    requestedOffset,
                 rangeEnd =
                     requestedRangeEnd,
             )
@@ -2731,7 +2722,7 @@ class TuneBudsMediaSync(
 
                 rangeStart
                     ?.takeIf {
-                        it > 0L
+                        it >= 0L
                     }
                     ?.let { start ->
                         val end =
