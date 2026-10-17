@@ -281,7 +281,7 @@ private class EmptyRemoteMediaException(
 /**
  * TuneBuds / AB Mate media synchronization.
  *
- * E1749 build #45 standard HTTP streaming for media files:
+ * E1749 build #46 finalize camera before media sync:
  * - Restores the vendor-style Wi-Fi Direct path: E6 mode 2.
  * - Uses F2 as the authoritative P2P peer MAC.
  * - Uses the E7 endpoint as the authoritative media HTTP base URL.
@@ -418,7 +418,34 @@ class TuneBudsMediaSync(
             state =
                 state.copy(
                     detail =
-                        "D1/7: Sin cierre extra de cámara",
+                        "D1/7: Cerrando cámara y esperando guardado",
+                    lastError =
+                        null,
+                )
+
+            Log.i(
+                TAG,
+                state.detail,
+            )
+
+            onState(
+                state,
+            )
+
+            /*
+             * E1749 must leave recording/camera mode before E6/E7.
+             * If video/audio is still recording, E2 stops it and waits through
+             * REP_BUSY_SAVING until the firmware reports REP_CLOSED.
+             * This also finalizes a recently captured photo before the HTTP
+             * file manager is started.
+             */
+            manager
+                .finishTransferBlocking()
+
+            state =
+                state.copy(
+                    detail =
+                        "D1b/7: Cámara cerrada; archivos guardados",
                     lastError =
                         null,
                 )
