@@ -244,22 +244,7 @@ class TuneBudsManager private constructor(context: Context) {
                         "E1749: photo completion notification received",
                     )
 
-                    /*
-                     * PHOTO_COMPLETE means the capture finished, but this E1749
-                     * can still keep the camera/file subsystem open. Close it
-                     * explicitly so the new JPEG is fully committed and readable
-                     * through the Wi-Fi file manager before we publish counts.
-                     */
-                    delay(
-                        500L,
-                    )
-
-                    stopCameraSubsystem()
-
-                    Log.i(
-                        TAG,
-                        "E1749: photo camera subsystem closed after capture",
-                    )
+                    delay(500L)
 
                     requireSuccess(
                         request(
