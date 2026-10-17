@@ -34,8 +34,6 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
-import okhttp3.OkHttpClient
-import okhttp3.Request
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
@@ -51,7 +49,6 @@ import java.net.URL
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.Collections
-import java.util.concurrent.TimeUnit
 import kotlin.coroutines.coroutineContext
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -281,7 +278,7 @@ private class EmptyRemoteMediaException(
 /**
  * TuneBuds / AB Mate media synchronization.
  *
- * E1749 build #46 finalize camera before media sync:
+ * E1749 build #47 raw HTTP after camera finalization:
  * - Restores the vendor-style Wi-Fi Direct path: E6 mode 2.
  * - Uses F2 as the authoritative P2P peer MAC.
  * - Uses the E7 endpoint as the authoritative media HTTP base URL.
@@ -306,13 +303,10 @@ class TuneBudsMediaSync(
             4_000
 
         private const val MEDIA_DOWNLOAD_MAX_ATTEMPTS =
-            40
+            12
 
         private const val MEDIA_DOWNLOAD_RETRY_MS =
-            250L
-
-        private const val MEDIA_RANGE_CHUNK_BYTES =
-            256L * 1024L
+            500L
 
         private const val RAW_HTTP_CONNECT_TIMEOUT_MS =
             20_000
@@ -328,32 +322,6 @@ class TuneBudsMediaSync(
 
         private const val P2P_CLEANUP_TIMEOUT_MS =
             4_000L
-
-
-        /*
-         * Use the proven standard HTTP stack for media payloads.
-         * The custom raw-socket/range downloader is kept only as legacy
-         * diagnostic code below, but is no longer used by sync().
-         */
-        private val MEDIA_HTTP_CLIENT =
-            OkHttpClient
-                .Builder()
-                .connectTimeout(
-                    20,
-                    TimeUnit.SECONDS,
-                )
-                .readTimeout(
-                    180,
-                    TimeUnit.SECONDS,
-                )
-                .writeTimeout(
-                    30,
-                    TimeUnit.SECONDS,
-                )
-                .retryOnConnectionFailure(
-                    true,
-                )
-                .build()
     }
 
     private val appContext:
@@ -432,13 +400,6 @@ class TuneBudsMediaSync(
                 state,
             )
 
-            /*
-             * E1749 must leave recording/camera mode before E6/E7.
-             * If video/audio is still recording, E2 stops it and waits through
-             * REP_BUSY_SAVING until the firmware reports REP_CLOSED.
-             * This also finalizes a recently captured photo before the HTTP
-             * file manager is started.
-             */
             manager
                 .finishTransferBlocking()
 
@@ -1784,13 +1745,11 @@ class TuneBudsMediaSync(
             var lastFailure:
                 Throwable? = null
 
-            /*
-             * Do not try to resume with Range here. This E1749 HTTP server has
-             * proven unreliable when Range is used/ignored. A normal streaming
-             * GET is closer to the validated TuneBuds transfer path.
-             */
+            var lastAdvertisedLength =
+                -1L
+
             repeat(
-                3,
+                MEDIA_DOWNLOAD_MAX_ATTEMPTS,
             ) { index ->
 
                 coroutineContext
@@ -1799,211 +1758,144 @@ class TuneBudsMediaSync(
                 val attempt =
                     index + 1
 
-                output.delete()
+                val resumeFrom =
+                    output.length()
 
-                onDiagnostic(
-                    "D7a/7: Descarga HTTP normal " +
-                        "(intento $attempt/3)",
+                Log.i(
+                    TAG,
+                    "HOTSPOT RESUME media download " +
+                        "attempt $attempt/" +
+                        "$MEDIA_DOWNLOAD_MAX_ATTEMPTS: " +
+                        item.remoteName +
+                        ", resumeFrom=$resumeFrom",
                 )
 
                 try {
-                    val request =
-                        Request
-                            .Builder()
-                            .url(
-                                mediaUrl,
-                            )
-                            .header(
-                                "Connection",
-                                "close",
-                            )
-                            .header(
-                                "User-Agent",
-                                "TSClient/1.0",
-                            )
-                            .header(
-                                "Accept-Encoding",
-                                "identity",
-                            )
-                            .get()
-                            .build()
-
-                    MEDIA_HTTP_CLIENT
-                        .newCall(
-                            request,
+                    val result =
+                        rawHttpDownload(
+                            mediaUrl,
+                            output,
+                            item,
+                            onProgress,
+                            resumeFrom,
                         )
-                        .execute()
-                        .use { response ->
 
-                            if (
-                                !response.isSuccessful
-                            ) {
-                                throw IOException(
-                                    "TuneBuds HTTP ${response.code} " +
-                                        "for ${item.fileName}",
-                                )
-                            }
+                    lastAdvertisedLength =
+                        result.advertisedLength
 
-                            val body =
-                                response.body
-                                    ?: throw IOException(
-                                        "TuneBuds returned no body " +
-                                            "for ${item.fileName}",
-                                    )
+                    if (
+                        result.readError != null
+                    ) {
+                        lastFailure =
+                            result.readError
 
-                            val advertisedLength =
-                                body.contentLength()
+                        Log.w(
+                            TAG,
+                            "HOTSPOT RESUME stream incomplete; " +
+                                "saved=${output.length()} bytes, " +
+                                "expected=${result.advertisedLength}, " +
+                                "error=${result.readError.message}",
+                        )
 
-                            var copied =
-                                0L
+                        onDiagnostic(
+                            "D7a/7: Flujo incompleto: ${output.length()} bytes; reintentando",
+                        )
+                    }
 
-                            var lastUiUpdateAt =
-                                0L
+                    val savedLength =
+                        output.length()
 
-                            body
-                                .byteStream()
-                                .buffered(
-                                    256 * 1024,
-                                )
-                                .use { input ->
-
-                                    output
-                                        .outputStream()
-                                        .buffered(
-                                            256 * 1024,
-                                        )
-                                        .use { target ->
-
-                                            val buffer =
-                                                ByteArray(
-                                                    256 * 1024,
-                                                )
-
-                                            while (true) {
-                                                coroutineContext
-                                                    .ensureActive()
-
-                                                val count =
-                                                    input.read(
-                                                        buffer,
-                                                    )
-
-                                                if (
-                                                    count <
-                                                    0
-                                                ) {
-                                                    break
-                                                }
-
-                                                if (
-                                                    count ==
-                                                    0
-                                                ) {
-                                                    continue
-                                                }
-
-                                                target.write(
-                                                    buffer,
-                                                    0,
-                                                    count,
-                                                )
-
-                                                copied +=
-                                                    count
-
-                                                /*
-                                                 * Do not block the socket reader
-                                                 * on a Main-thread UI update for
-                                                 * every network read. Roughly
-                                                 * four updates/second is enough.
-                                                 */
-                                                val now =
-                                                    System.currentTimeMillis()
-
-                                                if (
-                                                    now -
-                                                        lastUiUpdateAt >=
-                                                        250L
-                                                ) {
-                                                    lastUiUpdateAt =
-                                                        now
-
-                                                    onProgress(
-                                                        item,
-                                                        copied,
-                                                        advertisedLength,
-                                                    )
-                                                }
-                                            }
-                                        }
-                                }
-
-                            onProgress(
-                                item,
-                                copied,
-                                advertisedLength,
-                            )
-
-                            val complete =
-                                copied >
-                                    0L &&
-                                    (
-                                        advertisedLength <=
-                                            0L ||
-                                            copied >=
-                                            advertisedLength
-                                        )
-
-                            if (
-                                !complete
-                            ) {
-                                throw IOException(
-                                    "TuneBuds HTTP ended early: " +
-                                        "$copied/" +
-                                        if (
-                                            advertisedLength >
-                                            0L
-                                        ) {
-                                            advertisedLength
-                                        } else {
-                                            "?"
-                                        } +
-                                        " bytes",
-                                )
-                            }
-
-                            val structurallyValid =
-                                validateDownloadedMedia(
-                                    item,
-                                    output,
+                    val transportComplete =
+                        result.readError == null &&
+                            savedLength > 0L &&
+                            (
+                                result.advertisedLength <= 0L ||
+                                    savedLength >=
+                                    result.advertisedLength
                                 )
 
-                            Log.i(
-                                TAG,
-                                "Standard HTTP media complete: " +
-                                    "saved=$copied, " +
-                                    "advertised=$advertisedLength, " +
-                                    "structuralValid=$structurallyValid, " +
-                                    "file=${item.fileName}",
-                            )
-
-                            onDiagnostic(
-                                if (
-                                    structurallyValid
-                                ) {
-                                    "D7b/7: Transferencia completa; " +
-                                        "formato reconocido"
+                    onDiagnostic(
+                        if (transportComplete) {
+                            "D7a/7: Transferencia completa: $savedLength bytes"
+                        } else {
+                            "D7a/7: Transferencia incompleta: $savedLength/" +
+                                if (result.advertisedLength > 0L) {
+                                    result.advertisedLength
                                 } else {
-                                    "D7b/7: Transferencia completa; " +
-                                        "importando formato no estándar"
-                                },
-                            )
+                                    "?"
+                                } +
+                                " bytes"
+                        },
+                    )
 
-                            return@withContext output
-                        }
+                    val structurallyValid =
+                        validateDownloadedMedia(
+                            item,
+                            output,
+                        )
+
+                    Log.i(
+                        TAG,
+                        "HOTSPOT RESUME saved=$savedLength, " +
+                            "advertised=${result.advertisedLength}, " +
+                            "transportComplete=$transportComplete, " +
+                            "structuralValid=$structurallyValid, " +
+                            "file=${item.fileName}",
+                    )
+
+                    /*
+                     * The official TuneBuds client stores the HTTP payload; it does
+                     * not reject a completed transfer because of an extra local
+                     * JPEG/MP4 parser. Treat HTTP completeness as authoritative.
+                     * Structural parsing remains diagnostic only.
+                     */
+                    if (transportComplete) {
+                        onDiagnostic(
+                            if (structurallyValid) {
+                                "D7b/7: Transferencia OK; formato reconocido"
+                            } else {
+                                "D7b/7: Transferencia OK; importando formato no estándar"
+                            },
+                        )
+
+                        Log.i(
+                            TAG,
+                            "Media accepted after complete hotspot HTTP: " +
+                                "$savedLength bytes",
+                        )
+
+                        return@withContext output
+                    }
+
+                    if (
+                        output.length() == 0L &&
+                        attempt >= 3
+                    ) {
+                        onDiagnostic(
+                            "D7b/7: 0 bytes tras $attempt intentos; saltando ${item.fileName}",
+                        )
+
+                        throw EmptyRemoteMediaException(
+                            item.remoteName,
+                        )
+                    }
+
+                    if (
+                        result.readError == null
+                    ) {
+                        lastFailure =
+                            IOException(
+                                "Downloaded media transfer is incomplete",
+                            )
+                    }
                 } catch (
                     error:
                         CancellationException,
+                ) {
+                    throw error
+                } catch (
+                    error:
+                        EmptyRemoteMediaException,
                 ) {
                     throw error
                 } catch (
@@ -2015,38 +1907,56 @@ class TuneBudsMediaSync(
 
                     Log.w(
                         TAG,
-                        "Standard HTTP attempt $attempt/3 failed " +
-                            "for ${item.fileName}; saved=${output.length()}: " +
+                        "HOTSPOT RESUME attempt $attempt failed; " +
+                            "keeping ${output.length()} bytes: " +
                             (error.message
                                 ?: error.javaClass.simpleName),
                         error,
                     )
 
+                    /*
+                     * Some stale/ghost media entries fail before an HTTP body is
+                     * ever produced, so validation is never reached. If the same
+                     * item remains at zero bytes for three attempts, treat it as
+                     * unavailable for this sync and continue with the next item.
+                     */
                     if (
-                        output.length() ==
-                        0L &&
-                        attempt >=
-                        3
+                        output.length() == 0L &&
+                        attempt >= 3
                     ) {
+                        onDiagnostic(
+                            "D7/7: 0 bytes tras $attempt intentos; " +
+                                "saltando ${item.fileName}",
+                        )
+
                         throw EmptyRemoteMediaException(
                             item.remoteName,
                         )
                     }
+                }
 
-                    if (
-                        attempt <
-                        3
-                    ) {
-                        delay(
-                            750L,
-                        )
-                    }
+                if (
+                    attempt <
+                    MEDIA_DOWNLOAD_MAX_ATTEMPTS
+                ) {
+                    delay(
+                        MEDIA_DOWNLOAD_RETRY_MS,
+                    )
                 }
             }
 
             throw IOException(
-                "TuneBuds standard HTTP download failed " +
-                    "after 3 attempts; saved=${output.length()} bytes",
+                "TuneBuds resumable hotspot download failed " +
+                    "after $MEDIA_DOWNLOAD_MAX_ATTEMPTS attempts; " +
+                    "saved=${output.length()} bytes, " +
+                    "advertised=" +
+                    if (
+                        lastAdvertisedLength > 0L
+                    ) {
+                        lastAdvertisedLength
+                    } else {
+                        "?"
+                    },
                 lastFailure,
             )
         }
@@ -2104,20 +2014,16 @@ class TuneBudsMediaSync(
                     socket.getOutputStream(),
                 )
 
-            val requestedRangeEnd =
-                requestedOffset +
-                    MEDIA_RANGE_CHUNK_BYTES -
-                    1L
-
             sendHttpGet(
                 networkOutput,
                 url,
                 port,
                 path,
                 rangeStart =
-                    requestedOffset,
-                rangeEnd =
-                    requestedRangeEnd,
+                    requestedOffset
+                        .takeIf {
+                            it > 0L
+                        },
             )
 
             val input =
@@ -2263,7 +2169,6 @@ class TuneBudsMediaSync(
                     "contentLength=$responseLength, " +
                     "contentRange=$contentRange, " +
                     "resume=$requestedOffset, " +
-                    "requestedEnd=${requestedRangeEnd ?: "open"}, " +
                     "advertised=$advertisedLength, " +
                     "file=${item.fileName}",
             )
@@ -2788,8 +2693,6 @@ class TuneBudsMediaSync(
             String,
         rangeStart:
             Long? = null,
-        rangeEnd:
-            Long? = null,
     ) {
         val hostHeader =
             if (
@@ -2829,22 +2732,11 @@ class TuneBudsMediaSync(
 
                 rangeStart
                     ?.takeIf {
-                        it >= 0L
+                        it > 0L
                     }
                     ?.let { start ->
-                        val end =
-                            rangeEnd
-                                ?.takeIf {
-                                    it >=
-                                        start
-                                }
-
                         append(
-                            if (end != null) {
-                                "Range: bytes=$start-$end\r\n"
-                            } else {
-                                "Range: bytes=$start-\r\n"
-                            },
+                            "Range: bytes=$start-\r\n",
                         )
                     }
 
