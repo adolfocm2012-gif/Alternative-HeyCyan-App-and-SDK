@@ -3,7 +3,6 @@ package com.fersaiyan.cyanbridge.devices.tunebuds
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.BitmapFactory
-import android.media.MediaExtractor
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -269,16 +268,10 @@ private data class RawHttpDownloadResult(
     val readError: IOException?,
 )
 
-private class EmptyRemoteMediaException(
-    val remoteName: String,
-) : IOException(
-    "TuneBuds returned an empty media file: $remoteName",
-)
-
 /**
  * TuneBuds / AB Mate media synchronization.
  *
- * E1749 build #48 close camera only when recording is active:
+ * E1749 build #37 Android JPEG decoder fallback:
  * - Restores the vendor-style Wi-Fi Direct path: E6 mode 2.
  * - Uses F2 as the authoritative P2P peer MAC.
  * - Uses the E7 endpoint as the authoritative media HTTP base URL.
@@ -383,65 +376,13 @@ class TuneBudsMediaSync(
         temporaryDirectory.mkdirs()
 
         try {
-            val managerState =
-                manager
-                    .state
-                    .value
-
-            val recordingActive =
-                managerState.isVideoRecording ||
-                    managerState.isAudioRecording
-
-            if (recordingActive) {
-                state =
-                    state.copy(
-                        detail =
-                            "D1/7: Grabación activa; cerrando cámara",
-                        lastError =
-                            null,
-                    )
-
-                Log.i(
-                    TAG,
-                    state.detail,
+            state =
+                state.copy(
+                    detail =
+                        "D1/7: Sin cierre extra de cámara",
+                    lastError =
+                        null,
                 )
-
-                onState(
-                    state,
-                )
-
-                manager
-                    .finishTransferBlocking()
-
-                /*
-                 * Give the firmware a short moment after REP_CLOSED before
-                 * switching to Wi-Fi file-manager mode.
-                 */
-                delay(
-                    750L,
-                )
-
-                state =
-                    state.copy(
-                        detail =
-                            "D1b/7: Grabación cerrada y guardada",
-                        lastError =
-                            null,
-                    )
-            } else {
-                /*
-                 * Do not send an extra E2 when the camera is already closed.
-                 * On this E1749 that extra close correlates with valid manifest
-                 * entries returning zero-byte HTTP bodies.
-                 */
-                state =
-                    state.copy(
-                        detail =
-                            "D1/7: Cámara ya inactiva; sin E2 extra",
-                        lastError =
-                            null,
-                    )
-            }
 
             Log.i(
                 TAG,
@@ -594,43 +535,40 @@ class TuneBudsMediaSync(
             )
 
             if (items.isEmpty()) {
-                val rawPreviewForLog =
+                val rawPreviewForUi =
                     manifestPreview(
                         manifestBody,
-                        RAW_PREVIEW_LOG_LIMIT,
+                        RAW_PREVIEW_UI_LIMIT,
                     )
 
-                Log.i(
+                val diagnostic =
+                    "media.config RAW " +
+                        "(${manifestBody.length} chars): " +
+                        rawPreviewForUi
+
+                Log.w(
                     TAG,
-                    "E1749 media.config contains no compatible media: " +
-                        rawPreviewForLog,
+                    "E1749 $diagnostic",
                 )
 
                 state =
                     state.copy(
-                        total =
-                            0,
-                        completed =
-                            0,
                         detail =
-                            "Sincronización completada: no hay archivos pendientes",
+                            "D6/7: media.config sin archivos compatibles",
                         lastError =
-                            null,
+                            diagnostic,
                     )
 
                 onState(
                     state,
                 )
 
-                return Result.success(
-                    0,
+                throw IOException(
+                    diagnostic,
                 )
             }
 
             var completed =
-                0
-
-            var skippedEmpty =
                 0
 
             for (item in items) {
@@ -655,53 +593,27 @@ class TuneBudsMediaSync(
                 )
 
                 val file =
-                    try {
-                        download(
-                            baseUrl,
-                            item,
-                            onProgress,
-                        ) { diagnostic ->
-                            state =
-                                state.copy(
-                                    detail =
-                                        diagnostic,
-                                    lastError =
-                                        null,
-                                )
-
-                            Log.i(
-                                TAG,
-                                diagnostic,
-                            )
-
-                            onState(
-                                state,
-                            )
-                        }
-                    } catch (
-                        error:
-                            EmptyRemoteMediaException,
-                    ) {
-                        skippedEmpty++
-
+                    download(
+                        baseUrl,
+                        item,
+                        onProgress,
+                    ) { diagnostic ->
                         state =
                             state.copy(
                                 detail =
-                                    "D7/7: Archivo vacío saltado: ${item.fileName}",
+                                    diagnostic,
                                 lastError =
-                                    "El servidor devolvió 0 bytes; se reintentará en otra sincronización",
+                                    null,
                             )
 
-                        Log.w(
+                        Log.i(
                             TAG,
-                            "Skipping empty TuneBuds media item: ${item.remoteName}",
+                            diagnostic,
                         )
 
                         onState(
                             state,
                         )
-
-                        continue
                     }
 
                 state =
@@ -820,12 +732,7 @@ class TuneBudsMediaSync(
             state =
                 state.copy(
                     detail =
-                        if (skippedEmpty > 0) {
-                            "Sincronización completada: $completed importado(s), " +
-                                "$skippedEmpty vacío(s) saltado(s)"
-                        } else {
-                            "Sincronización por hotspot completada"
-                        },
+                        "Sincronización por hotspot completada",
                     lastError =
                         null,
                 )
@@ -883,25 +790,6 @@ class TuneBudsMediaSync(
             withContext(
                 NonCancellable,
             ) {
-                /*
-                 * E7 leaves the camera/file-transfer subsystem active on this
-                 * firmware. Always send E2 before tearing down Wi-Fi so a sync
-                 * (including an empty sync or a failed download) cannot leave
-                 * Photo/Video controls stuck in a busy/transfer state.
-                 */
-                runCatching {
-                    manager
-                        .finishTransferBlocking()
-                }.onFailure { error ->
-                    Log.w(
-                        TAG,
-                        "E1749 camera/file-manager cleanup failed: " +
-                            (error.message
-                                ?: error.javaClass.simpleName),
-                        error,
-                    )
-                }
-
                 cleanupP2p()
 
                 hotspot.stop()
@@ -1834,82 +1722,40 @@ class TuneBudsMediaSync(
                         )
                     }
 
-                    val savedLength =
-                        output.length()
-
-                    val transportComplete =
-                        result.readError == null &&
-                            savedLength > 0L &&
-                            (
-                                result.advertisedLength <= 0L ||
-                                    savedLength >=
-                                    result.advertisedLength
-                                )
-
                     onDiagnostic(
-                        if (transportComplete) {
-                            "D7a/7: Transferencia completa: $savedLength bytes"
-                        } else {
-                            "D7a/7: Transferencia incompleta: $savedLength/" +
-                                if (result.advertisedLength > 0L) {
-                                    result.advertisedLength
-                                } else {
-                                    "?"
-                                } +
-                                " bytes"
-                        },
+                        "D7a/7: Recibidos ${output.length()} bytes; validando ${item.fileName}",
                     )
 
-                    val structurallyValid =
+                    val valid =
                         validateDownloadedMedia(
                             item,
                             output,
                         )
 
+                    onDiagnostic(
+                        if (valid) {
+                            "D7b/7: Validación OK (${output.length()} bytes)"
+                        } else {
+                            "D7b/7: VALIDACIÓN FALLÓ (${output.length()} bytes)"
+                        },
+                    )
+
                     Log.i(
                         TAG,
-                        "HOTSPOT RESUME saved=$savedLength, " +
+                        "HOTSPOT RESUME saved=${output.length()}, " +
                             "advertised=${result.advertisedLength}, " +
-                            "transportComplete=$transportComplete, " +
-                            "structuralValid=$structurallyValid, " +
+                            "valid=$valid, " +
                             "file=${item.fileName}",
                     )
 
-                    /*
-                     * The official TuneBuds client stores the HTTP payload; it does
-                     * not reject a completed transfer because of an extra local
-                     * JPEG/MP4 parser. Treat HTTP completeness as authoritative.
-                     * Structural parsing remains diagnostic only.
-                     */
-                    if (transportComplete) {
-                        onDiagnostic(
-                            if (structurallyValid) {
-                                "D7b/7: Transferencia OK; formato reconocido"
-                            } else {
-                                "D7b/7: Transferencia OK; importando formato no estándar"
-                            },
-                        )
-
+                    if (valid) {
                         Log.i(
                             TAG,
-                            "Media accepted after complete hotspot HTTP: " +
-                                "$savedLength bytes",
+                            "Media accepted after resumable hotspot HTTP: " +
+                                "${output.length()} bytes",
                         )
 
                         return@withContext output
-                    }
-
-                    if (
-                        output.length() == 0L &&
-                        attempt >= 3
-                    ) {
-                        onDiagnostic(
-                            "D7b/7: 0 bytes tras $attempt intentos; saltando ${item.fileName}",
-                        )
-
-                        throw EmptyRemoteMediaException(
-                            item.remoteName,
-                        )
                     }
 
                     if (
@@ -1917,17 +1763,12 @@ class TuneBudsMediaSync(
                     ) {
                         lastFailure =
                             IOException(
-                                "Downloaded media transfer is incomplete",
+                                "Downloaded media is structurally incomplete",
                             )
                     }
                 } catch (
                     error:
                         CancellationException,
-                ) {
-                    throw error
-                } catch (
-                    error:
-                        EmptyRemoteMediaException,
                 ) {
                     throw error
                 } catch (
@@ -1945,26 +1786,6 @@ class TuneBudsMediaSync(
                                 ?: error.javaClass.simpleName),
                         error,
                     )
-
-                    /*
-                     * Some stale/ghost media entries fail before an HTTP body is
-                     * ever produced, so validation is never reached. If the same
-                     * item remains at zero bytes for three attempts, treat it as
-                     * unavailable for this sync and continue with the next item.
-                     */
-                    if (
-                        output.length() == 0L &&
-                        attempt >= 3
-                    ) {
-                        onDiagnostic(
-                            "D7/7: 0 bytes tras $attempt intentos; " +
-                                "saltando ${item.fileName}",
-                        )
-
-                        throw EmptyRemoteMediaException(
-                            item.remoteName,
-                        )
-                    }
                 }
 
                 if (
@@ -3099,251 +2920,155 @@ class TuneBudsMediaSync(
             return false
         }
 
-        val strictValid =
-            runCatching {
-                RandomAccessFile(
-                    file,
-                    "r",
-                ).use { raf ->
-
-                    val fileLength =
-                        raf.length()
-
-                    var position =
-                        0L
-
-                    var hasFtyp =
-                        false
-
-                    var hasMoov =
-                        false
-
-                    var hasMdat =
-                        false
-
-                    while (
-                        position <
-                        fileLength
-                    ) {
-                        if (
-                            fileLength -
-                            position <
-                            8L
-                        ) {
-                            return@use false
-                        }
-
-                        raf.seek(
-                            position,
-                        )
-
-                        val size32 =
-                            raf
-                                .readInt()
-                                .toLong() and
-                                0xffffffffL
-
-                        val typeBytes =
-                            ByteArray(
-                                4,
-                            )
-
-                        raf.readFully(
-                            typeBytes,
-                        )
-
-                        val type =
-                            String(
-                                typeBytes,
-                                StandardCharsets.ISO_8859_1,
-                            )
-
-                        var headerSize =
-                            8L
-
-                        val boxSize =
-                            when (
-                                size32
-                            ) {
-                                0L -> {
-                                    fileLength -
-                                        position
-                                }
-
-                                1L -> {
-                                    if (
-                                        fileLength -
-                                        position <
-                                        16L
-                                    ) {
-                                        return@use false
-                                    }
-
-                                    headerSize =
-                                        16L
-
-                                    val extended =
-                                        raf.readLong()
-
-                                    if (
-                                        extended <=
-                                        0L
-                                    ) {
-                                        return@use false
-                                    }
-
-                                    extended
-                                }
-
-                                else ->
-                                    size32
-                            }
-
-                        if (
-                            boxSize <
-                            headerSize
-                        ) {
-                            return@use false
-                        }
-
-                        val boxEnd =
-                            position +
-                                boxSize
-
-                        if (
-                            boxEnd <
-                            position ||
-                            boxEnd >
-                            fileLength
-                        ) {
-                            return@use false
-                        }
-
-                        when (
-                            type
-                        ) {
-                            "ftyp" ->
-                                hasFtyp =
-                                    true
-
-                            "moov" ->
-                                hasMoov =
-                                    true
-
-                            "mdat" ->
-                                hasMdat =
-                                    true
-                        }
-
-                        position =
-                            boxEnd
-                    }
-
-                    position ==
-                        fileLength &&
-                        hasFtyp &&
-                        hasMoov &&
-                        hasMdat
-                }
-            }
-                .getOrDefault(
-                    false,
-                )
-
-        if (
-            strictValid
-        ) {
-            Log.i(
-                TAG,
-                "MP4 strict validation OK; bytes=${file.length()}",
-            )
-
-            return true
-        }
-
-        Log.w(
-            TAG,
-            "MP4 strict box validation failed; " +
-                "trying Android MediaExtractor; bytes=${file.length()}",
-        )
-
-        /*
-         * Camera MP4 files do not always match the simplistic top-level box
-         * assumptions above. Android's own media parser is a better final
-         * authority for whether the downloaded file exposes a real video track.
-         */
         return runCatching {
-            val extractor =
-                MediaExtractor()
+            RandomAccessFile(
+                file,
+                "r",
+            ).use { raf ->
 
-            try {
-                extractor.setDataSource(
-                    file.absolutePath,
-                )
+                val fileLength =
+                    raf.length()
 
-                var hasVideoTrack =
+                var position =
+                    0L
+
+                var hasFtyp =
                     false
 
-                var videoMime:
-                    String? = null
+                var hasMoov =
+                    false
 
-                for (
-                    index in
-                    0 until
-                    extractor.trackCount
+                var hasMdat =
+                    false
+
+                while (
+                    position <
+                    fileLength
                 ) {
-                    val format =
-                        extractor.getTrackFormat(
-                            index,
+                    if (
+                        fileLength -
+                        position <
+                        8L
+                    ) {
+                        return@use false
+                    }
+
+                    raf.seek(
+                        position,
+                    )
+
+                    val size32 =
+                        raf
+                            .readInt()
+                            .toLong() and
+                            0xffffffffL
+
+                    val typeBytes =
+                        ByteArray(
+                            4,
                         )
 
-                    val mime =
-                        format.getString(
-                            android.media.MediaFormat.KEY_MIME,
+                    raf.readFully(
+                        typeBytes,
+                    )
+
+                    val type =
+                        String(
+                            typeBytes,
+                            StandardCharsets.ISO_8859_1,
                         )
+
+                    var headerSize =
+                        8L
+
+                    val boxSize =
+                        when (
+                            size32
+                        ) {
+                            0L -> {
+                                fileLength -
+                                    position
+                            }
+
+                            1L -> {
+                                if (
+                                    fileLength -
+                                    position <
+                                    16L
+                                ) {
+                                    return@use false
+                                }
+
+                                headerSize =
+                                    16L
+
+                                val extended =
+                                    raf.readLong()
+
+                                if (
+                                    extended <=
+                                    0L
+                                ) {
+                                    return@use false
+                                }
+
+                                extended
+                            }
+
+                            else ->
+                                size32
+                        }
 
                     if (
-                        mime
-                            ?.startsWith(
-                                "video/",
-                                ignoreCase = true,
-                            ) == true
+                        boxSize <
+                        headerSize
                     ) {
-                        hasVideoTrack =
-                            true
-
-                        videoMime =
-                            mime
-
-                        break
+                        return@use false
                     }
+
+                    val end =
+                        position +
+                            boxSize
+
+                    if (
+                        end <
+                        position ||
+                        end >
+                        fileLength
+                    ) {
+                        return@use false
+                    }
+
+                    when (
+                        type
+                    ) {
+                        "ftyp" ->
+                            hasFtyp =
+                                true
+
+                        "moov" ->
+                            hasMoov =
+                                true
+
+                        "mdat" ->
+                            hasMdat =
+                                true
+                    }
+
+                    position =
+                        end
                 }
 
-                Log.i(
-                    TAG,
-                    "MP4 Android parser fallback: " +
-                        "accepted=$hasVideoTrack, " +
-                        "tracks=${extractor.trackCount}, " +
-                        "videoMime=$videoMime, " +
-                        "bytes=${file.length()}",
-                )
-
-                hasVideoTrack
-            } finally {
-                extractor.release()
+                position ==
+                    fileLength &&
+                    hasFtyp &&
+                    hasMoov &&
+                    hasMdat
             }
         }
-            .getOrElse { error ->
-                Log.w(
-                    TAG,
-                    "MP4 Android parser fallback failed: " +
-                        (error.message
-                            ?: error.javaClass.simpleName),
-                    error,
-                )
-
-                false
-            }
+            .getOrDefault(
+                false,
+            )
     }
 
     private fun isCompleteJpeg(
