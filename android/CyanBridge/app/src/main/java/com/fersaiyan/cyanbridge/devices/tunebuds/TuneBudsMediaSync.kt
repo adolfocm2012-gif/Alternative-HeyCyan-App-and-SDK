@@ -278,7 +278,7 @@ private class EmptyRemoteMediaException(
 /**
  * TuneBuds / AB Mate media synchronization.
  *
- * E1749 build #47 raw HTTP after camera finalization:
+ * E1749 build #48 close camera only when recording is active:
  * - Restores the vendor-style Wi-Fi Direct path: E6 mode 2.
  * - Uses F2 as the authoritative P2P peer MAC.
  * - Uses the E7 endpoint as the authoritative media HTTP base URL.
@@ -383,33 +383,65 @@ class TuneBudsMediaSync(
         temporaryDirectory.mkdirs()
 
         try {
-            state =
-                state.copy(
-                    detail =
-                        "D1/7: Cerrando cámara y esperando guardado",
-                    lastError =
-                        null,
+            val managerState =
+                manager
+                    .state
+                    .value
+
+            val recordingActive =
+                managerState.isVideoRecording ||
+                    managerState.isAudioRecording
+
+            if (recordingActive) {
+                state =
+                    state.copy(
+                        detail =
+                            "D1/7: Grabación activa; cerrando cámara",
+                        lastError =
+                            null,
+                    )
+
+                Log.i(
+                    TAG,
+                    state.detail,
                 )
 
-            Log.i(
-                TAG,
-                state.detail,
-            )
-
-            onState(
-                state,
-            )
-
-            manager
-                .finishTransferBlocking()
-
-            state =
-                state.copy(
-                    detail =
-                        "D1b/7: Cámara cerrada; archivos guardados",
-                    lastError =
-                        null,
+                onState(
+                    state,
                 )
+
+                manager
+                    .finishTransferBlocking()
+
+                /*
+                 * Give the firmware a short moment after REP_CLOSED before
+                 * switching to Wi-Fi file-manager mode.
+                 */
+                delay(
+                    750L,
+                )
+
+                state =
+                    state.copy(
+                        detail =
+                            "D1b/7: Grabación cerrada y guardada",
+                        lastError =
+                            null,
+                    )
+            } else {
+                /*
+                 * Do not send an extra E2 when the camera is already closed.
+                 * On this E1749 that extra close correlates with valid manifest
+                 * entries returning zero-byte HTTP bodies.
+                 */
+                state =
+                    state.copy(
+                        detail =
+                            "D1/7: Cámara ya inactiva; sin E2 extra",
+                        lastError =
+                            null,
+                    )
+            }
 
             Log.i(
                 TAG,
