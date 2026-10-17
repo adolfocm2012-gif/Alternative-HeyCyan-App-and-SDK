@@ -376,6 +376,93 @@ class TuneBudsMediaSync(
         temporaryDirectory.mkdirs()
 
         try {
+            /*
+             * Recovery guard for a full/corrupted E1749 media filesystem.
+             *
+             * This destructive maintenance path is intentionally extremely
+             * narrow: it runs only when the glasses themselves report
+             * 0 visible media items AND <= 64 MiB free. If any photo, video or
+             * audio is visible, normal synchronization continues and nothing
+             * is deleted.
+             */
+            val recoveryStorage =
+                manager.state.value.storage
+
+            val recoveryCounts =
+                manager.state.value.mediaCounts
+
+            val shouldRecoverStorage =
+                recoveryStorage != null &&
+                    recoveryCounts != null &&
+                    recoveryCounts.total == 0L &&
+                    recoveryStorage.freeMiB <= 64L
+
+            if (shouldRecoverStorage) {
+                state =
+                    state.copy(
+                        detail =
+                            "MANTENIMIENTO: 0 medios visibles y " +
+                                "${recoveryStorage.freeMiB} MiB libres; " +
+                                "liberando almacenamiento multimedia",
+                        lastError =
+                            null,
+                    )
+
+                Log.w(
+                    TAG,
+                    state.detail,
+                )
+
+                onState(
+                    state,
+                )
+
+                manager
+                    .formatMediaStorageBlocking()
+
+                delay(
+                    750L,
+                )
+
+                val refreshed =
+                    manager.state.value.storage
+
+                val refreshedCounts =
+                    manager.state.value.mediaCounts
+
+                state =
+                    state.copy(
+                        detail =
+                            if (refreshed != null) {
+                                "MANTENIMIENTO completado: " +
+                                    "${refreshed.usedMiB} MiB usados / " +
+                                    "${refreshed.freeMiB} MiB libres; " +
+                                    "medios=${refreshedCounts?.total ?: 0}"
+                            } else {
+                                "MANTENIMIENTO completado; vuelve a consultar el almacenamiento"
+                            },
+                        completed =
+                            0,
+                        total =
+                            0,
+                        lastError =
+                            null,
+                    )
+
+                Log.i(
+                    TAG,
+                    state.detail,
+                )
+
+                onState(
+                    state,
+                )
+
+                return Result.success(
+                    0,
+                )
+            }
+
             state =
                 state.copy(
                     detail =
