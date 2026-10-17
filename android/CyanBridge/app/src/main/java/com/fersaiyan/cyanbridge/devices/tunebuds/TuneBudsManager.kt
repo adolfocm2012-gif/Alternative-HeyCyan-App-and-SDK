@@ -82,6 +82,7 @@ class TuneBudsManager private constructor(context: Context) {
         private const val FILE_MANAGER_MAX_ATTEMPTS = 30
         private const val CMD_P2P_PEER_ADDRESS = 0xF2
         private const val CMD_PHOTO_COMPLETE = 0xF3
+        private const val CMD_STORAGE_FORMAT_OR_DELETE = 0xEB
         private const val PHOTO_COMPLETE_TIMEOUT_MS = 15_000L
 
         @Volatile
@@ -384,6 +385,115 @@ class TuneBudsManager private constructor(context: Context) {
                 ),
             )
         }
+
+    /**
+     * Formats only the camera/media storage exposed by AB Mate command 0xEB.
+     *
+     * The reverse-engineered vendor protocol uses an empty 0xEB payload for
+     * media-storage format and a filename payload for single-file deletion.
+     * Firmware/OTA uses command 0xED, so this method does not touch firmware.
+     */
+    suspend fun formatMediaStorageBlocking() {
+        if (!client.isConnected()) {
+            throw IOException(
+                "Connect TuneBuds glasses before formatting media storage",
+            )
+        }
+
+        val before =
+            _state.value.storage
+
+        Log.w(
+            TAG,
+            "E1749: formatting media storage via 0xEB with empty payload",
+        )
+
+        requireSuccess(
+            request(
+                CMD_STORAGE_FORMAT_OR_DELETE,
+            ),
+        )
+
+        /*
+         * Give the camera filesystem time to rebuild its media index, then
+         * refresh storage/count telemetry. Do not treat a slow notification as
+         * a second destructive request: 0xEB is sent exactly once.
+         */
+        repeat(8) { attempt ->
+            delay(
+                if (attempt == 0) {
+                    2_000L
+                } else {
+                    1_000L
+                },
+            )
+
+            runCatching {
+                requireSuccess(
+                    request(
+                        TuneBudsProtocol.CMD_STORAGE,
+                    ),
+                )
+            }.onFailure {
+                Log.w(
+                    TAG,
+                    "Storage refresh after format failed on attempt ${attempt + 1}",
+                    it,
+                )
+            }
+
+            delay(
+                200L,
+            )
+
+            runCatching {
+                requireSuccess(
+                    request(
+                        TuneBudsProtocol.CMD_MEDIA_COUNTS,
+                    ),
+                )
+            }.onFailure {
+                Log.w(
+                    TAG,
+                    "Media-count refresh after format failed on attempt ${attempt + 1}",
+                    it,
+                )
+            }
+
+            val now =
+                _state.value.storage
+
+            val counts =
+                _state.value.mediaCounts
+
+            val storageChanged =
+                now != null &&
+                    (
+                        before == null ||
+                            now.freeMiB > before.freeMiB ||
+                            now.usedMiB < before.usedMiB
+                    )
+
+            if (
+                storageChanged &&
+                counts?.total == 0L
+            ) {
+                Log.i(
+                    TAG,
+                    "E1749: media storage format verified; " +
+                        "used=${now?.usedMiB} MiB free=${now?.freeMiB} MiB",
+                )
+
+                return
+            }
+        }
+
+        Log.w(
+            TAG,
+            "E1749: 0xEB format was accepted but refreshed storage " +
+                "did not visibly change within the verification window",
+        )
+    }
 
     fun requestMediaCount() =
         launchCommand("read media count") {
